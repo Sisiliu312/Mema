@@ -2,7 +2,7 @@
 cd /home/data/shika/LLaVA-LayerRouter-ca
 export PYTHONWARNINGS="ignore"
 # CUDA_VISIBLE_DEVICES=0
-SPLIT="tworouter-one-norm"
+SPLIT="QKNorm_all"
 
 /home/data/shika/miniconda3/envs/llava/bin/python -m llava.eval.model_vqa_loader \
     --model-path /home/data/shika/LLaVA-LayerRouter-ca/checkpoints/$SPLIT/llava-v1.5-7b \

@@ -182,106 +182,16 @@ class LlavaMetaForCausalLM(ABC):
     def get_layer_router(self):
         return self.get_model().get_layer_router()
 
-
-    # def encode_images(self, images, text_token):
-    #     # 获取24层特征
-    #     image_features, image_forward_outs = self.get_model().get_vision_tower()(images)
-
-    #     # 处理text
-    #     combined_text = torch.cat(text_token, dim=0)
-    #     if combined_text.dim() == 2:
-    #         combined_text = combined_text.unsqueeze(0)
-
-    #     # 初始化最终输出
-    #     batch_size, text_len, dim = combined_text.shape
-    #     batch_size = image_features.shape[0]
-    #     combined_features = torch.zeros(batch_size, text_len, dim, device=combined_text.device, dtype=combined_text.dtype)
-    #     # print("image_features shape:",image_features.shape)
-    #     # image_features = dense_connector(image_features, image_forward_outs, text_token)
-    #     for i in [3,8,13,18,23]:
-    #     # 获取当前层特征 [batch, num_patches, dim]
-    #         # layer_feat = image_forward_outs.hidden_states[i]
-    #         # layer_feat = image_forward_outs.hidden_states[i].half()
-    #         layer_feat = image_forward_outs.hidden_states[i][:, 1:].to(image_features.dtype)
-    #         # layer_feat = image_forward_outs.hidden_states[i].to(self.get_model().mm_projector.weight.dtype)
-    #         # print("layer_feat type:", type(layer_feat))
-    #         layer_features = self.get_model().mm_projector(layer_feat)
-    #         attended = self.get_model().ca(combined_text, layer_features)
-    #         combined_features += attended
-    #         # print("layer_feat type:", type(layer_feat))
-    #     return combined_features
-
-    # def encode_images(self, images, text_token):
-    #     """
-    #     Batched version - assumes all samples select the same top-5 layers.
-    #     More efficient but less flexible.
-    #     """
-    #     # 获取24层特征
-    #     image_features, image_forward_outs = self.get_model().get_vision_tower()(images)
-
-    #     use_router = getattr(self.get_model().config, 'use_router', False)
-    #     use_ca = getattr(self.get_model().config, 'use_ca', False)
-
-    #     if use_router and use_ca:
-    #     # 处理text
-    #         combined_text = torch.cat(text_token, dim=0)
-    #         if combined_text.dim() == 2:
-    #             combined_text = combined_text.unsqueeze(0)
-
-    #         # print("combined_text shape:", combined_text.shape)
-
-    #         # 初始化最终输出
-    #         batch_size, text_len, dim = combined_text.shape
-    #         batch_size = image_features.shape[0]
-    #         combined_features = torch.zeros(
-    #             batch_size, text_len, dim, 
-    #             device=combined_text.device, 
-    #             dtype=combined_text.dtype
-    #         )
-            
-    #         # Use router to select top-5 layers
-    #         # For batched version, use first sample's selection for all
-    #         top_indices, top_weights, all_probs = self.get_model().layer_router(combined_text)
-            
-    #         # Use the most common selection or first sample's selection
-    #         # selected_indices = top_indices[0]
-    #         # selected_weights = top_weights[0]
-    #         print(f"Selected layers: {top_indices.tolist()}")
-    #         # print(f"Layer weights: {top_weights.tolist()}")
-            
-    #         for idx in range(len(top_indices)):
-    #         # 获取当前层特征 [batch, num_patches, dim]
-    #             # layer_feat = image_forward_outs.hidden_states[i]
-    #             # layer_feat = image_forward_outs.hidden_states[i].half()
-    #             layer_idx = top_indices[idx].item()  # 转为整数用于索引
-    #             weight = top_weights[idx]
-
-    #             layer_feat = image_forward_outs.hidden_states[layer_idx][:, 1:].to(image_features.dtype)
-    #             # print("layer_feat shape:", layer_feat.shape)
-    #             # layer_feat = image_forward_outs.hidden_states[i].to(self.get_model().mm_projector.weight.dtype)
-    #             # print("layer_feat type:", type(layer_feat))
-    #             layer_features = self.get_model().mm_projector(layer_feat)
-
-    #             attended = self.get_model().ca(combined_text, layer_features)
-
-    #             # print("layer_feat type:", type(layer_feat))
-    #             combined_features += weight * attended
-                
-    #             # print(f"Processed layer {idx}")
-    #             # print("combined_features shape:", combined_features.shape)
-
-    #     else:
-    #         combined_features = self.get_model().mm_projector(image_features)
-            
-    #     return combined_features
-
     def encode_images(self, images, text_token):
         """
         Batched version - supports flexible combinations of router and CA.
-        Handles: no router/CA, only router, only CA, or both.
+        Args:
+            images: [batch_size, 3, H, W] 或 [batch_size, num_crops, 3, H, W]
+            text_token: List[Tuple[Tensor]], 每个元素是一个 batch 的文本片段列表
         """
         # 获取24层特征
         image_features, image_forward_outs = self.get_model().get_vision_tower()(images)
+        batch_size = image_features.shape[0]
 
         use_router = getattr(self.get_model().config, 'use_router', False)
         use_ca = getattr(self.get_model().config, 'use_ca', False)
@@ -291,24 +201,63 @@ class LlavaMetaForCausalLM(ABC):
             combined_features = self.get_model().mm_projector(image_features)
             return combined_features
 
-        # 准备text token
-        combined_text = torch.cat(text_token, dim=0)
-        if combined_text.dim() == 2:
-            combined_text = combined_text.unsqueeze(0)
-        # print("combined_text shape:",combined_text.shape)
-
-        batch_size = image_features.shape[0]
-        text_len = combined_text.shape[1]
+        # ========== 处理文本 embeddings ==========
+        # text_token 是 List[Tuple[Tensor]]
+        # 每个 Tuple 包含该 batch 的多个文本片段
+        batch_text_embeddings = []
+        text_lengths = []  # 记录每个 batch 的实际文本长度（不含padding）
         
-        # Case 2: 只使用CA，不使用Router - 对最后一层特征做CA
+        for batch_idx in range(len(text_token)):
+            # text_token[batch_idx] 是一个 tuple，包含多个文本片段
+            text_segments = text_token[batch_idx]
+            
+            # 拼接所有文本片段
+            if len(text_segments) > 0:
+                batch_text = torch.cat(list(text_segments), dim=0)  # [text_len, dim]
+                batch_text_embeddings.append(batch_text)
+                text_lengths.append(batch_text.shape[0])
+            else:
+                # 如果没有文本，创建一个占位符
+                dummy_text = torch.zeros(1, text_token[0][0].shape[-1], 
+                                        device=images.device, 
+                                        dtype=text_token[0][0].dtype)
+                batch_text_embeddings.append(dummy_text)
+                text_lengths.append(0)
+        
+        # 找到最大长度并 pad
+        max_text_len = max(t.shape[0] for t in batch_text_embeddings)
+        
+        padded_texts = []
+        attention_masks = []  # 用于标记哪些是真实文本，哪些是padding
+        
+        for text_embed, actual_len in zip(batch_text_embeddings, text_lengths):
+            # 创建 attention mask
+            attn_mask = torch.zeros(max_text_len, device=text_embed.device, dtype=torch.bool)
+            if actual_len > 0:
+                attn_mask[:actual_len] = True
+            
+            # Pad 到 max_len
+            if text_embed.shape[0] < max_text_len:
+                padding = torch.zeros(
+                    max_text_len - text_embed.shape[0], text_embed.shape[1],
+                    device=text_embed.device, dtype=text_embed.dtype
+                )
+                text_embed = torch.cat([text_embed, padding], dim=0)
+            
+            padded_texts.append(text_embed.unsqueeze(0))  # [1, text_len, dim]
+            attention_masks.append(attn_mask.unsqueeze(0))  # [1, text_len]
+        
+        combined_text = torch.cat(padded_texts, dim=0)  # [batch_size, text_len, dim]
+        text_attention_mask = torch.cat(attention_masks, dim=0)  # [batch_size, text_len]
+
+        # Case 2: 只使用CA，不使用Router
         if use_ca and not use_router:
-            # 使用最后一层的特征（layer 23，即index -1）
             last_layer_feat = image_forward_outs.hidden_states[-1][:, 1:].to(image_features.dtype)
             last_layer_features = self.get_model().mm_projector(last_layer_feat)
             combined_features = self.get_model().ca(combined_text, last_layer_features)
             return combined_features
 
-        # Case 3: 只使用Router，不使用CA - 加权融合多层特征
+        # Case 3: 只使用Router，不使用CA
         if use_router and not use_ca:
             dim = self.get_model().mm_projector(image_forward_outs.hidden_states[0][:, 1:]).shape[-1]
             combined_features = torch.zeros(
@@ -318,7 +267,12 @@ class LlavaMetaForCausalLM(ABC):
             )
             
             if self.training:
-                router_output = self.get_model().layer_router(combined_text, return_loss=True)
+                # 传入 attention mask 给 router
+                router_output = self.get_model().layer_router(
+                    combined_text, 
+                    attention_mask=text_attention_mask,
+                    return_loss=True
+                )
                 
                 if len(router_output) == 4:
                     top_indices, top_weights, all_probs, diversity_loss = router_output
@@ -329,10 +283,10 @@ class LlavaMetaForCausalLM(ABC):
                     top_indices, top_weights, all_probs = router_output
             else:
                 top_indices, top_weights, all_probs = self.get_model().layer_router(
-                    combined_text, return_loss=False
+                    combined_text, 
+                    attention_mask=text_attention_mask,
+                    return_loss=False
                 )
-            
-            # print(f"Selected layers: {top_indices.tolist()}")
             
             # 加权融合选中的层
             for idx in range(len(top_indices)):
@@ -343,38 +297,39 @@ class LlavaMetaForCausalLM(ABC):
                 layer_features = self.get_model().mm_projector(layer_feat)
                 combined_features += weight * layer_features
             
-            # print("Combined features shape (Router only):", combined_features.shape)
             return combined_features
 
-        # Case 4: 同时使用Router和CA - 原有逻辑
+        # Case 4: 同时使用Router和CA
         if use_router and use_ca:
+            text_len = combined_text.shape[1]
             dim = combined_text.shape[-1]
+            
             combined_features = torch.zeros(
                 batch_size, text_len, dim,
                 device=combined_text.device,
                 dtype=combined_text.dtype
             )
-
-            # if torch.isnan(combined_features).any():
-            #     print("⚠️ combined_features initialized with NaN!")
             
             if self.training:
-                router_output = self.get_model().layer_router(combined_text, return_loss=True)
+                router_output = self.get_model().layer_router(
+                    combined_text, 
+                    attention_mask=text_attention_mask,
+                    return_loss=True
+                )
                 
                 if len(router_output) == 4:
                     top_indices, top_weights, all_probs, diversity_loss = router_output
                     
                     if hasattr(self.get_model(), '_router_diversity_losses'):
                         self.get_model()._router_diversity_losses.append(diversity_loss)
-                        # print(f"  ✅ Added diversity_loss: {diversity_loss.item():.6f}")
                 else:
                     top_indices, top_weights, all_probs = router_output
             else:
                 top_indices, top_weights, all_probs = self.get_model().layer_router(
-                    combined_text, return_loss=False
+                    combined_text, 
+                    attention_mask=text_attention_mask,
+                    return_loss=False
                 )
-            
-            # print(f"Selected layers: {top_indices.tolist()}")
             
             # Router选中的层 + CA attention
             for idx in range(len(top_indices)):
@@ -382,29 +337,17 @@ class LlavaMetaForCausalLM(ABC):
                 weight = top_weights[idx]
 
                 layer_feat = image_forward_outs.hidden_states[layer_idx][:, 1:].to(image_features.dtype)
-                # print("layer_feat shape",layer_feat.shape)
-
-                # if torch.isnan(layer_feat).any() or torch.isinf(layer_feat).any():
-                #     print(f"⚠️ Layer {layer_idx}: NaN/Inf in vision tower output")
-
                 layer_features = self.get_model().mm_projector(layer_feat)
-                # print("layer_features shape",layer_features.shape)
 
                 if torch.isnan(layer_features).any() or torch.isinf(layer_features).any():
                     print(f"⚠️ Layer {layer_idx}: NaN/Inf in projector output")
-                    print(f"   Range: [{layer_features.min():.4f}, {layer_features.max():.4f}]")
 
-                # print(f"\n🔍 Before CA for layer {layer_idx}:")
-                # print(f"  layer_features: range=[{layer_features.min():.4f}, {layer_features.max():.4f}], has_inf={torch.isinf(layer_features).any()}")
                 attended = self.get_model().ca(combined_text, layer_features)
 
                 if torch.isnan(attended).any() or torch.isinf(attended).any():
                     print(f"⚠️ Layer {layer_idx}: NaN/Inf in CA output")
-                    print(f"   Range: [{attended.min():.4f}, {attended.max():.4f}]")
                 
                 combined_features += weight * attended
-                # print("combined_features shape:",combined_features.shape)
-                # print(f"  combined_features: range=[{combined_features.min():.4f}, {combined_features.max():.4f}], has_inf={torch.isinf(combined_features).any()}")
             
             return combined_features
 
@@ -421,78 +364,70 @@ class LlavaMetaForCausalLM(ABC):
             if tune_router and hasattr(self.get_model(), 'layer_router'):
                 self.get_model()._router_diversity_losses = []
         
-        # ################################
-        origi_input_ids = input_ids
-        origi_labels = labels
+        # ========== 第一步：保存原始输入并提取纯文本 token embeddings ==========
+        # 保存原始值用于后续恢复
         _labels = labels
         _position_ids = position_ids
         _attention_mask = attention_mask
-
-        no_attention_mask = False
-        no_position_ids = False
-        no_labels =False
-
+        
+        # 处理 None 的情况
         if attention_mask is None:
-            no_attention_mask = True
             attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
         else:
             attention_mask = attention_mask.bool()
+        
         if position_ids is None:
-            no_position_ids = True
             position_ids = torch.arange(0, input_ids.shape[1], dtype=torch.long, device=input_ids.device)
+        
         if labels is None:
-            no_labels = True
             labels = torch.full_like(input_ids, IGNORE_INDEX)
         
-        _input_ids = input_ids
-        input_ids = [cur_input_ids[cur_attention_mask] for cur_input_ids, cur_attention_mask in zip(input_ids, attention_mask)]
-        labels = [cur_labels[cur_attention_mask] for cur_labels, cur_attention_mask in zip(labels, attention_mask)]
-
-        new_input_embeds = []
-        new_labels = []
-        cur_image_idx = 0
-        for batch_idx, cur_input_ids in enumerate(input_ids):
-            num_images = (cur_input_ids == IMAGE_TOKEN_INDEX).sum()
+        # 移除 padding（使用 attention_mask）
+        input_ids_list = [cur_input_ids[cur_attention_mask] 
+                        for cur_input_ids, cur_attention_mask in zip(input_ids, attention_mask)]
+        labels_list = [cur_labels[cur_attention_mask] 
+                    for cur_labels, cur_attention_mask in zip(labels, attention_mask)]
+        
+        # 提取所有 batch 的纯文本 embeddings（排除 IMAGE_TOKEN）
+        all_cur_input_embeds_no_im = []  # 存储所有 batch 的结果
+        
+        for batch_idx, cur_input_ids in enumerate(input_ids_list):
+            # 找到所有图像 token 的位置
             image_token_indices = [-1] + torch.where(cur_input_ids == IMAGE_TOKEN_INDEX)[0].tolist() + [cur_input_ids.shape[0]]
+            
+            # 提取非图像部分的 token ids
             cur_input_ids_noim = []
-            cur_labels = labels[batch_idx]
-            cur_labels_noim = []
             for i in range(len(image_token_indices) - 1):
                 cur_input_ids_noim.append(cur_input_ids[image_token_indices[i]+1:image_token_indices[i+1]])
-                cur_labels_noim.append(cur_labels[image_token_indices[i]+1:image_token_indices[i+1]])
-            split_sizes = [x.shape[0] for x in cur_labels_noim]
+            
+            # 转换为 embeddings 并分割
+            split_sizes = [x.shape[0] for x in cur_input_ids_noim]
             cur_input_embeds = self.get_model().embed_tokens(torch.cat(cur_input_ids_noim))
             cur_input_embeds_no_im = torch.split(cur_input_embeds, split_sizes, dim=0)
-
-        if self.training:  # 训练阶段
-            input_ids = origi_input_ids
-            labels = origi_labels
-
-            if no_attention_mask:
-                attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
-            else:
-                attention_mask = attention_mask.bool()
-            if no_position_ids is None:
-                position_ids = torch.arange(0, input_ids.shape[1], dtype=torch.long, device=input_ids.device)
-            if no_labels is None:
-                labels = torch.full_like(input_ids, IGNORE_INDEX)
-        else:  # 评估阶段
-            pass
-
-        # ################################
+            
+            all_cur_input_embeds_no_im.append(cur_input_embeds_no_im)
         
+        # ========== 第二步：编码图像特征 ==========
         if type(images) is list or images.ndim == 5:
             if type(images) is list:
                 images = [x.unsqueeze(0) if x.ndim == 3 else x for x in images]
             concat_images = torch.cat([image for image in images], dim=0)
-            image_features = self.encode_images(concat_images, cur_input_embeds_no_im)
+            
+            # 使用第一个 batch 的文本 embeddings（或者根据需求调整）
+            # image_features = self.encode_images(concat_images, all_cur_input_embeds_no_im[0])
+            image_features = self.encode_images(concat_images, all_cur_input_embeds_no_im)
+            
             split_sizes = [image.shape[0] for image in images]
             image_features = torch.split(image_features, split_sizes, dim=0)
+            
+            # 处理 spatial merge 等逻辑
             mm_patch_merge_type = getattr(self.config, 'mm_patch_merge_type', 'flat')
             image_aspect_ratio = getattr(self.config, 'image_aspect_ratio', 'square')
+            
             if mm_patch_merge_type == 'flat':
                 image_features = [x.flatten(0, 1) for x in image_features]
             elif mm_patch_merge_type.startswith('spatial'):
+                # ... (保持你原有的 spatial 处理逻辑)
                 new_image_features = []
                 for image_idx, image_feature in enumerate(image_features):
                     if image_feature.shape[0] > 1:
@@ -501,7 +436,9 @@ class LlavaMetaForCausalLM(ABC):
                         height = width = self.get_vision_tower().num_patches_per_side
                         assert height * width == base_image_feature.shape[0]
                         if image_aspect_ratio == 'anyres':
-                            num_patch_width, num_patch_height = get_anyres_image_grid_shape(image_sizes[image_idx], self.config.image_grid_pinpoints, self.get_vision_tower().config.image_size)
+                            num_patch_width, num_patch_height = get_anyres_image_grid_shape(
+                                image_sizes[image_idx], self.config.image_grid_pinpoints, 
+                                self.get_vision_tower().config.image_size)
                             image_feature = image_feature.view(num_patch_height, num_patch_width, height, width, -1)
                         else:
                             raise NotImplementedError
@@ -530,62 +467,34 @@ class LlavaMetaForCausalLM(ABC):
             else:
                 raise ValueError(f"Unexpected mm_patch_merge_type: {self.config.mm_patch_merge_type}")
         else:
-            image_features = self.encode_images(images, cur_input_embeds_no_im)
+            image_features = self.encode_images(images, all_cur_input_embeds_no_im)
 
-        # TODO: image start / end is not implemented here to support pretraining.
-        if getattr(self.config, 'tune_mm_mlp_adapter', False) and getattr(self.config, 'mm_use_im_start_end', False):
-            raise NotImplementedError
-
-        # Let's just add dummy tensors if they do not exist,
-        # it is a headache to deal with None all the time.
-        # But it is not ideal, and if you have a better idea,
-        # please open an issue / submit a PR, thanks.
-
-        # remove the padding using attention_mask -- FIXME
-        if self.training:
-            _labels = labels
-            _position_ids = position_ids
-            _attention_mask = attention_mask
-            if attention_mask is None:
-                attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
-            else:
-                attention_mask = attention_mask.bool()
-            if position_ids is None:
-                position_ids = torch.arange(0, input_ids.shape[1], dtype=torch.long, device=input_ids.device)
-            if labels is None:
-                labels = torch.full_like(input_ids, IGNORE_INDEX)
-        else:
-            pass
-
-        _input_ids = input_ids
-        input_ids = [cur_input_ids[cur_attention_mask] for cur_input_ids, cur_attention_mask in zip(input_ids, attention_mask)]
-        labels = [cur_labels[cur_attention_mask] for cur_labels, cur_attention_mask in zip(labels, attention_mask)]
-
+        # ========== 第三步：合并文本和图像 embeddings ==========
         new_input_embeds = []
         new_labels = []
         cur_image_idx = 0
-        for batch_idx, cur_input_ids in enumerate(input_ids):
+        
+        for batch_idx, cur_input_ids in enumerate(input_ids_list):
             num_images = (cur_input_ids == IMAGE_TOKEN_INDEX).sum()
+            
             if num_images == 0:
                 cur_image_features = image_features[cur_image_idx]
                 cur_input_embeds_1 = self.get_model().embed_tokens(cur_input_ids)
                 cur_input_embeds = torch.cat([cur_input_embeds_1, cur_image_features[0:0]], dim=0)
                 new_input_embeds.append(cur_input_embeds)
-                new_labels.append(labels[batch_idx])
+                new_labels.append(labels_list[batch_idx])
                 cur_image_idx += 1
                 continue
 
+            # 使用预先提取的文本 embeddings
+            cur_input_embeds_no_im = all_cur_input_embeds_no_im[batch_idx]
+            
+            # 获取对应的 labels
             image_token_indices = [-1] + torch.where(cur_input_ids == IMAGE_TOKEN_INDEX)[0].tolist() + [cur_input_ids.shape[0]]
-            cur_input_ids_noim = []
-            cur_labels = labels[batch_idx]
+            cur_labels = labels_list[batch_idx]
             cur_labels_noim = []
             for i in range(len(image_token_indices) - 1):
-                cur_input_ids_noim.append(cur_input_ids[image_token_indices[i]+1:image_token_indices[i+1]])
                 cur_labels_noim.append(cur_labels[image_token_indices[i]+1:image_token_indices[i+1]])
-            split_sizes = [x.shape[0] for x in cur_labels_noim]
-            cur_input_embeds = self.get_model().embed_tokens(torch.cat(cur_input_ids_noim))
-            cur_input_embeds_no_im = torch.split(cur_input_embeds, split_sizes, dim=0)
-
 
             cur_new_input_embeds = []
             cur_new_labels = []
@@ -597,30 +506,32 @@ class LlavaMetaForCausalLM(ABC):
                     cur_image_features = image_features[cur_image_idx]
                     cur_image_idx += 1
                     cur_new_input_embeds.append(cur_image_features)
-                    cur_new_labels.append(torch.full((cur_image_features.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
+                    cur_new_labels.append(torch.full((cur_image_features.shape[0],), IGNORE_INDEX, 
+                                                    device=cur_labels.device, dtype=cur_labels.dtype))
 
             cur_new_input_embeds = [x.to(self.device) for x in cur_new_input_embeds]
-
             cur_new_input_embeds = torch.cat(cur_new_input_embeds)
             cur_new_labels = torch.cat(cur_new_labels)
 
             new_input_embeds.append(cur_new_input_embeds)
             new_labels.append(cur_new_labels)
 
-        # Truncate sequences to max length as image embeddings can make the sequence longer
+        # ========== 第四步：Padding 和最终处理 ==========
         tokenizer_model_max_length = getattr(self.config, 'tokenizer_model_max_length', None)
         if tokenizer_model_max_length is not None:
             new_input_embeds = [x[:tokenizer_model_max_length] for x in new_input_embeds]
             new_labels = [x[:tokenizer_model_max_length] for x in new_labels]
 
-        # Combine them
         max_len = max(x.shape[0] for x in new_input_embeds)
         batch_size = len(new_input_embeds)
 
         new_input_embeds_padded = []
-        new_labels_padded = torch.full((batch_size, max_len), IGNORE_INDEX, dtype=new_labels[0].dtype, device=new_labels[0].device)
-        attention_mask = torch.zeros((batch_size, max_len), dtype=attention_mask.dtype, device=attention_mask.device)
-        position_ids = torch.zeros((batch_size, max_len), dtype=position_ids.dtype, device=position_ids.device)
+        new_labels_padded = torch.full((batch_size, max_len), IGNORE_INDEX, 
+                                    dtype=new_labels[0].dtype, device=new_labels[0].device)
+        attention_mask = torch.zeros((batch_size, max_len), dtype=_attention_mask.dtype if _attention_mask is not None else torch.bool, 
+                                    device=input_ids.device)
+        position_ids = torch.zeros((batch_size, max_len), dtype=_position_ids.dtype if _position_ids is not None else torch.long, 
+                                device=input_ids.device)
 
         for i, (cur_new_embed, cur_new_labels) in enumerate(zip(new_input_embeds, new_labels)):
             cur_len = cur_new_embed.shape[0]
@@ -644,8 +555,8 @@ class LlavaMetaForCausalLM(ABC):
                     position_ids[i, :cur_len] = torch.arange(0, cur_len, dtype=position_ids.dtype, device=position_ids.device)
 
         new_input_embeds = torch.stack(new_input_embeds_padded, dim=0)
-        # print("new_input_embeds shape", new_input_embeds.shape)
 
+        # 根据原始输入决定返回值
         if _labels is None:
             new_labels = None
         else:
@@ -653,8 +564,6 @@ class LlavaMetaForCausalLM(ABC):
 
         if _attention_mask is None:
             attention_mask = None
-        else:
-            attention_mask = attention_mask.to(dtype=_attention_mask.dtype)
 
         if _position_ids is None:
             position_ids = None

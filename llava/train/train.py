@@ -44,6 +44,9 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 local_rank = None
 
+import os
+os.environ["WANDB_DISABLED"] = "true"
+
 
 def rank0_print(*args):
     if local_rank == 0:
@@ -755,11 +758,10 @@ class LazySupervisedDataset(Dataset):
 
 @dataclass
 class DataCollatorForSupervisedDataset(object):
-    """Collate examples for supervised fine-tuning."""
-
     tokenizer: transformers.PreTrainedTokenizer
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
+
         input_ids, labels = tuple([instance[key] for instance in instances]
                                   for key in ("input_ids", "labels"))
         input_ids = torch.nn.utils.rnn.pad_sequence(
@@ -797,6 +799,7 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
     return dict(train_dataset=train_dataset,
                 eval_dataset=None,
                 data_collator=data_collator)
+
 
 def register_gradient_hooks(model):
     """为不同模块设置不同的梯度放大系数"""
