@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 import json
 import logging
 import pathlib
+import dataclasses
 from typing import Dict, Optional, Sequence, List
 
 import torch
@@ -44,8 +45,8 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 local_rank = None
 
-import os
-os.environ["WANDB_DISABLED"] = "true"
+# import os
+# os.environ["WANDB_DISABLED"] = "true"
 
 
 def rank0_print(*args):
@@ -85,7 +86,6 @@ class DataArguments:
     is_multimodal: bool = False
     image_folder: Optional[str] = field(default=None)
     image_aspect_ratio: str = 'square'
-
 
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
@@ -222,6 +222,7 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
                 torch.save(weight_to_save, os.path.join(mm_projector_folder, f'{current_folder}.bin'))
             else:
                 torch.save(weight_to_save, os.path.join(output_dir, f'mm_projector.bin'))
+
         return
 
     if trainer.deepspeed:
@@ -837,6 +838,33 @@ def register_gradient_hooks(model):
                 return hook_fn
             param.register_hook(make_hook(name))
 
+def find_tensors_recursive(obj, path="root"):
+    """递归查找所有 Tensor"""
+    if isinstance(obj, torch.Tensor):
+        print(f"  ⚠️ Found Tensor at {path}: shape={obj.shape}, device={obj.device}")
+        return True
+    elif isinstance(obj, dict):
+        found = False
+        for k, v in obj.items():
+            if find_tensors_recursive(v, f"{path}.{k}"):
+                found = True
+        return found
+    elif isinstance(obj, (list, tuple)):
+        found = False
+        for i, v in enumerate(obj):
+            if find_tensors_recursive(v, f"{path}[{i}]"):
+                found = True
+        return found
+    elif dataclasses.is_dataclass(obj):
+        found = False
+        for field in dataclasses.fields(obj):
+            v = getattr(obj, field.name)
+            if find_tensors_recursive(v, f"{path}.{field.name}"):
+                found = True
+        return found
+    return False
+
+
 def train(attn_implementation=None):
     global local_rank
 
@@ -1091,6 +1119,12 @@ def train(attn_implementation=None):
         trainer.train(resume_from_checkpoint=True)
     else:
         trainer.train()
+
+    # print("\n🔍 深度检查 trainer.state:")
+    # find_tensors_recursive(trainer.state, "trainer.state")
+
+    # print("\n🔍 深度检查 model.config:")
+    # find_tensors_recursive(model.config, "model.config")
 
     trainer.save_state()
 
