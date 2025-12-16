@@ -88,72 +88,67 @@ class AttentionWeightSaver:
 saver = AttentionWeightSaver(save_dir='/home/data/shika/LLaVA/playground/data/eval/textvqa', format='pt')
 
 class CrossAttention(nn.Module):
-    def __init__(self, text_dim, feature_dim, num_heads):
+    def __init__(self, text_dim, feature_dim):
         super(CrossAttention, self).__init__()
         self.text_dim = text_dim
         self.feature_dim = feature_dim
-        self.num_heads = num_heads
-        self.head_dim = feature_dim // num_heads
         self.W_q = nn.Linear(text_dim, feature_dim)
         self.W_k = nn.Linear(feature_dim, feature_dim)
+        # self.feature_norm = nn.LayerNorm(feature_dim)
         self.feature_norm = LlamaRMSNorm(feature_dim)
+        # self.output_norm = LlamaRMSNorm(feature_dim)
         self.q_norm = LlamaRMSNorm(feature_dim)
         self.k_norm = LlamaRMSNorm(feature_dim)
-        self.out_proj = nn.Linear(feature_dim, feature_dim)
-
+        
         self._reset_parameters()
 
     def _reset_parameters(self):
         nn.init.xavier_uniform_(self.W_q.weight)
         nn.init.xavier_uniform_(self.W_k.weight)
-        nn.init.xavier_uniform_(self.out_proj.weight, gain=0.1)
 
     def forward(self, text, features):
-        """
-        Args:
-            text: [B, T, D_text] - text embeddings
-            features: [B, N, D_feat] - image features
-        Returns:
-            output: [B, T, D_feat] - attended features
-        """
-        B, T, _ = text.shape
-        _, N, _ = features.shape
+        # ============ 步骤1: 检查输入 ============
+        # print(f"\n{'='*60}")
+        # print("🔍 CrossAttention Debug:")
+        # print(f"  text shape: {text.shape}, range: [{text.min():.4f}, {text.max():.4f}]")
+        # print(f"  features shape: {features.shape}, range: [{features.min():.4f}, {features.max():.4f}]")
         
-        # ============ Step 1: Normalize features ============
+        # ============ 步骤2: 线性变换 ============
         features = self.feature_norm(features)
+        Q = self.W_q(text)
+        K = self.W_k(features)
+        Q = self.q_norm(Q)
+        K = self.k_norm(K)
         
-        # ============ Step 2: Project to Q, K ============
-        Q = self.W_q(text)       # [B, T, D_feat]
-        K = self.W_k(features)   # [B, N, D_feat]
+        # print(f"  After linear transform:")
+        # print(f"    Q range: [{Q.min():.4f}, {Q.max():.4f}], has_nan={torch.isnan(Q).any()}, has_inf={torch.isinf(Q).any()}")
+        # print(f"    K range: [{K.min():.4f}, {K.max():.4f}], has_nan={torch.isnan(K).any()}, has_inf={torch.isinf(K).any()}")
         
-        # ============ Step 3: Normalize Q, K ============
-        Q = self.q_norm(Q)       # [B, T, D_feat]
-        K = self.k_norm(K)       # [B, N, D_feat]
+        # ✅ 检查权重
+        # print(f"  Weight stats:")
+        # print(f"    W_q.weight: range=[{self.W_q.weight.min():.4f}, {self.W_q.weight.max():.4f}], norm={self.W_q.weight.norm():.4f}")
+        # print(f"    W_k.weight: range=[{self.W_k.weight.min():.4f}, {self.W_k.weight.max():.4f}], norm={self.W_k.weight.norm():.4f}")
         
-        # ============ Step 4: Reshape for multi-head ============
-        # Q: [B, T, D_feat] -> [B, T, num_heads, head_dim] -> [B, num_heads, T, head_dim]
-        Q = Q.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)  # [B, H, T, D/H]
-        K = K.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)  # [B, H, N, D/H]
+        # ============ 如果Q或K已经有Inf，直接返回零 ============
+        # if torch.isinf(Q).any() or torch.isinf(K).any():
+        #     print("⚠️ Q or K contains Inf! Returning zeros to avoid crash.")
+        #     return torch.zeros_like(text)
         
-        # V 直接从 features 来（不投影）
-        V = features.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)  # [B, H, N, D/H]
+        # ============ 步骤3: 计算attention scores ============
+        attn_scores = torch.matmul(Q, K.transpose(1, 2))
         
-        # ============ Step 5: Compute attention ============
-        attn_scores = torch.matmul(Q, K.transpose(-2, -1))  # [B, H, T, N]
-        attn_scores = attn_scores / (self.head_dim ** 0.5)
-        attn_weights = torch.softmax(attn_scores, dim=-1)   # [B, H, T, N]
+        # if torch.isnan(attn_scores).any() or torch.isinf(attn_scores).any():
+        #     print(f"⚠️ attn_scores after matmul: has_nan={torch.isnan(attn_scores).any()}, has_inf={torch.isinf(attn_scores).any()}")
+        #     print(f"   attn_scores range: [{attn_scores.min():.4f}, {attn_scores.max():.4f}]")
         
-        # ============ Step 6: Apply attention to values ============
-        attn_output = torch.matmul(attn_weights, V)  # [B, H, T, D/H]
+        attn_scores = attn_scores / (K.size(-1) ** 0.5)
+        attn_weights = torch.softmax(attn_scores, dim=-1)
+        attended = torch.matmul(attn_weights, features)
+        # attended = self.output_norm(attended)
         
-        # ============ Step 7: Merge heads ============
-        attn_output = attn_output.transpose(1, 2).contiguous()  # [B, T, H, D/H]
-        attn_output = attn_output.view(B, T, self.feature_dim)  # [B, T, D_feat]
+        # print(f"{'='*60}\n")
         
-        # ============ Step 8: Output projection ============
-        output = self.out_proj(attn_output)  # [B, T, D_feat]
-        
-        return output
+        return attended
 
 class AttentionLayerRouter(nn.Module):
     def __init__(self, dim, num_layers, top_router):
@@ -194,14 +189,60 @@ class AttentionLayerRouter(nn.Module):
             for idx in uniform_indices:
                 self.router[2].bias[idx] = 1
     
+    # def compute_diversity_loss(self, layer_probs):
+    #     """
+    #     目标：
+    #     1. 三个组的总概率都接近 1/3（组间平衡）
+    #     2. 在每个组内，选择集中到少数几层（组内集中）
+    #     """
+    #     # 1. 组间平衡损失
+    #     shallow_prob = layer_probs[:, 0:8].sum(dim=-1)   # [batch_size]
+    #     middle_prob = layer_probs[:, 8:16].sum(dim=-1)
+    #     deep_prob = layer_probs[:, 16:24].sum(dim=-1)
+        
+    #     ideal_prob = 1.0 / 3.0
+    #     group_balance_loss = (
+    #         (shallow_prob - ideal_prob) ** 2 +
+    #         (middle_prob - ideal_prob) ** 2 +
+    #         (deep_prob - ideal_prob) ** 2
+    #     ).mean()
+        
+    #     # 2. 组内熵损失（在每个组内鼓励集中）
+    #     epsilon = 1e-10
+        
+    #     # 计算每个组内的条件概率分布
+    #     shallow_probs = layer_probs[:, 0:8] / (shallow_prob.unsqueeze(-1) + epsilon)
+    #     middle_probs = layer_probs[:, 8:16] / (middle_prob.unsqueeze(-1) + epsilon)
+    #     deep_probs = layer_probs[:, 16:24] / (deep_prob.unsqueeze(-1) + epsilon)
+        
+    #     # 计算组内熵
+    #     max_entropy_per_group = torch.log(torch.tensor(8.0, device=layer_probs.device))
+        
+    #     shallow_entropy = -(shallow_probs * torch.log(shallow_probs + epsilon)).sum(dim=-1)
+    #     middle_entropy = -(middle_probs * torch.log(middle_probs + epsilon)).sum(dim=-1)
+    #     deep_entropy = -(deep_probs * torch.log(deep_probs + epsilon)).sum(dim=-1)
+        
+    #     # 归一化到 [0, 1]
+    #     intra_group_entropy = (
+    #         shallow_entropy / max_entropy_per_group +
+    #         middle_entropy / max_entropy_per_group +
+    #         deep_entropy / max_entropy_per_group
+    #     ).mean() / 3.0
+        
+    #     # print(f"    Balance: {group_balance_loss.item():.6f}, "
+    #         # f"Intra-Entropy: {intra_group_entropy.item():.6f}")
+        
+    #     # 总损失：都是最小化目标
+    #     total_loss = group_balance_loss + 0.3 * intra_group_entropy
+        
+    #     return total_loss
+
     def compute_diversity_loss(self, layer_probs):
         """
-        目标：
-        1. 三个组的总概率都接近 1/3（组间平衡）
-        2. 在每个组内，选择集中到少数几层（组内集中）
+        修正版多样性损失：确保始终为正
         """
-        # 1. 组间平衡损失
-        shallow_prob = layer_probs[:, 0:8].sum(dim=-1)   # [batch_size]
+        # 1. 组间平衡损失（浅/中/深层均匀分布）
+        shallow_prob = layer_probs[:, 0:8].sum(dim=-1)
         middle_prob = layer_probs[:, 8:16].sum(dim=-1)
         deep_prob = layer_probs[:, 16:24].sum(dim=-1)
         
@@ -212,33 +253,21 @@ class AttentionLayerRouter(nn.Module):
             (deep_prob - ideal_prob) ** 2
         ).mean()
         
-        # 2. 组内熵损失（在每个组内鼓励集中）
+        # 2. 熵损失（鼓励在所有层之间均匀分布）
         epsilon = 1e-10
+        entropy = -(layer_probs * torch.log(layer_probs + epsilon)).sum(dim=-1)
+        max_entropy = torch.log(
+            torch.tensor(float(self.num_layers), 
+                        device=layer_probs.device, 
+                        dtype=layer_probs.dtype)
+        )
         
-        # 计算每个组内的条件概率分布
-        shallow_probs = layer_probs[:, 0:8] / (shallow_prob.unsqueeze(-1) + epsilon)
-        middle_probs = layer_probs[:, 8:16] / (middle_prob.unsqueeze(-1) + epsilon)
-        deep_probs = layer_probs[:, 16:24] / (deep_prob.unsqueeze(-1) + epsilon)
+        # 归一化熵损失：[0, 1]，越接近0越均匀
+        normalized_entropy = 1.0 - (entropy / max_entropy)
+        entropy_loss = normalized_entropy.mean()
         
-        # 计算组内熵
-        max_entropy_per_group = torch.log(torch.tensor(8.0, device=layer_probs.device))
-        
-        shallow_entropy = -(shallow_probs * torch.log(shallow_probs + epsilon)).sum(dim=-1)
-        middle_entropy = -(middle_probs * torch.log(middle_probs + epsilon)).sum(dim=-1)
-        deep_entropy = -(deep_probs * torch.log(deep_probs + epsilon)).sum(dim=-1)
-        
-        # 归一化到 [0, 1]
-        intra_group_entropy = (
-            shallow_entropy / max_entropy_per_group +
-            middle_entropy / max_entropy_per_group +
-            deep_entropy / max_entropy_per_group
-        ).mean() / 3.0
-        
-        # print(f"    Balance: {group_balance_loss.item():.6f}, "
-            # f"Intra-Entropy: {intra_group_entropy.item():.6f}")
-        
-        # 总损失：都是最小化目标
-        total_loss = group_balance_loss + 0.3 * intra_group_entropy
+        # 3. 组合损失
+        total_loss = group_balance_loss + 0.3 * entropy_loss
         
         return total_loss
 
@@ -307,9 +336,8 @@ def build_vision_projector(config, delay_load=False, **kwargs):
 def build_cross_attn(config):
     text_dim = config.text_dim if hasattr(config, 'text_dim') else 4096
     feature_dim = config.feature_dim if hasattr(config, 'feature_dim') else 4096
-    num_heads = config.num_heads if hasattr(config, 'num_heads') else 4
     
-    return CrossAttention(text_dim=text_dim, feature_dim=feature_dim, num_heads=num_heads)
+    return CrossAttention(text_dim=text_dim, feature_dim=feature_dim)
 
 def build_layer_router(config):
     # print("=" * 60)

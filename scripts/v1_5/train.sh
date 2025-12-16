@@ -2,7 +2,7 @@
 cd /home/data/shika/LLaVA-LayerRouter-ca
 export PYTHONWARNINGS="ignore"
 export PYTHONPATH=/home/data/shika/LLaVA-LayerRouter-ca
-SPLIT="multi-head+loss"
+SPLIT="no_double_weight+no_multihead+pastloss"
 
 /home/data/shika/miniconda3/envs/llava/bin/deepspeed --master_port 29501 --include localhost:0,1,2,3 llava/train/train_mem.py \
     --deepspeed ./scripts/zero2.json \

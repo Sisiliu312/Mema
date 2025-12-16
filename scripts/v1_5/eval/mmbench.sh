@@ -6,7 +6,7 @@ export PYTHONWARNINGS="ignore"
 SPLIT="mmbench_dev_20230712"
 
 /home/data/shika/miniconda3/envs/llava/bin/python -m llava.eval.model_vqa_mmbench \
-    --model-path /home/data/shika/LLaVA-LayerRouter-ca/checkpoints/entropy_loss/llava-v1.5-7b \
+    --model-path /home/data/shika/LLaVA-LayerRouter-ca/checkpoints/multihead+pastloss/llava-v1.5-7b \
     --question-file /home/data/shika/LLaVA/playground/data/eval/mmbench/$SPLIT.tsv \
     --answers-file /home/data/shika/LLaVA/playground/data/eval/mmbench/answers/$SPLIT/llava-v1.5-13b.jsonl \
     --single-pred-prompt \
