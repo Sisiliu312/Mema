@@ -72,10 +72,6 @@ class ModelArguments:
     mm_use_im_patch_token: bool = field(default=True)
     mm_patch_merge_type: Optional[str] = field(default='flat')
     mm_vision_select_feature: Optional[str] = field(default="patch")
-    use_ca: bool = field(default=False)
-    use_router: bool = field(default=False)
-    tune_ca: bool = field(default=False)
-    tune_router: bool = field(default=False)
 
 
 @dataclass
@@ -181,7 +177,7 @@ def get_mm_adapter_state_maybe_zero_3(named_params, keys_to_match):
 def find_all_linear_names(model):
     cls = torch.nn.Linear
     lora_module_names = set()
-    multimodal_keywords = ['mm_projector', 'vision_tower', 'vision_resampler', 'layer_router', 'ca']
+    multimodal_keywords = ['mm_projector', 'vision_tower', 'vision_resampler', 'text_dla']
     for name, module in model.named_modules():
         if any(mm_keyword in name for mm_keyword in multimodal_keywords):
             continue
@@ -200,12 +196,7 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
 
     if getattr(trainer.args, "tune_mm_mlp_adapter", False):
         # Only save Adapter
-        keys_to_match = ['mm_projector']
-
-        if hasattr(trainer.model.config, 'use_ca') and trainer.model.config.use_ca:
-            keys_to_match.append('ca')
-        if hasattr(trainer.model.config, 'use_router') and trainer.model.config.use_router:
-            keys_to_match.append('layer_router')
+        keys_to_match = ['mm_projector', "text_dla"]
 
         if getattr(trainer.args, "use_im_start_end", False):
             keys_to_match.extend(['embed_tokens', 'embed_in'])
@@ -802,41 +793,32 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
                 data_collator=data_collator)
 
 
+# def register_gradient_hooks(model):
+#     """为不同模块设置不同的梯度放大系数"""
+#     for name, param in model.named_parameters():
+#         if not param.requires_grad:
+#             continue
+#         if 'text_dla' in name:
+#             def make_hook(pname):
+#                 def hook_fn(grad):
+#                     if grad is not None:
+#                         print(f"[DLA] {pname}: {grad.norm():.6e}")
+#                     return grad
+#                 return hook_fn
+#             param.register_hook(make_hook(name))
+
 def register_gradient_hooks(model):
-    """为不同模块设置不同的梯度放大系数"""
-    
-    print("\n🚀 注册梯度放大 Hooks")
-    
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        
-        if 'layer_router' in name:
-            def make_hook(pname):
-                def hook_fn(grad):
-                    if grad is not None:
-                        print(f"[Router] {pname}: {grad.norm():.6e}")
-                    return grad
-                return hook_fn
-            param.register_hook(make_hook(name))
-            
-        elif 'ca.' in name or 'W_q' in name or 'W_k' in name:
-            def make_hook(pname):
-                def hook_fn(grad):
-                    if grad is not None:
-                        print(f"[CA] {pname}: {grad.norm():.6e}")
-                    return grad
-                return hook_fn
-            param.register_hook(make_hook(name))
-            
-        elif 'mm_projector' in name:
-            # Projector 不放大
-            def make_hook(pname):
-                def hook_fn(grad):
-                    if grad is not None:
-                        print(f"[Proj] {pname}: {grad.norm():.4f} (1x)")
-                return hook_fn
-            param.register_hook(make_hook(name))
+        def make_hook(pname):
+            def hook_fn(grad):
+                if grad is not None:
+                    print(f"[Grad] {pname}: {grad.norm().item():.6e}")
+                return grad
+            return hook_fn
+
+        param.register_hook(make_hook(name))
 
 def find_tensors_recursive(obj, path="root"):
     """递归查找所有 Tensor"""
@@ -969,10 +951,6 @@ def train(attn_implementation=None):
                 model.to(torch.float16)
         rank0_print("Adding LoRA adapters...")
         model = get_peft_model(model, lora_config)
-        if model_args.use_router and not model_args.tune_router:
-            for name, param in model.named_parameters():
-                if 'layer_router' in name:
-                    param.requires_grad = False
 
     if 'mpt' in model_args.model_name_or_path:
         tokenizer = transformers.AutoTokenizer.from_pretrained(
@@ -1025,36 +1003,19 @@ def train(attn_implementation=None):
 
         model.config.tune_mm_mlp_adapter = training_args.tune_mm_mlp_adapter = model_args.tune_mm_mlp_adapter
 
-        model.config.use_ca = model_args.use_ca
-        model.config.use_router = model_args.use_router
-        model.config.tune_ca = model_args.tune_ca
-        model.config.tune_router = model_args.tune_router
         
         if model_args.tune_mm_mlp_adapter:
             model.requires_grad_(False)
             for p in model.get_model().mm_projector.parameters():
                 p.requires_grad = True
             
-            if model_args.use_ca:
-                ca_module = model.get_model().get_cross_attn()
-                if ca_module is not None:
-                    if model_args.tune_ca:
-                        for p in ca_module.parameters():
-                            p.requires_grad = True
-                    else:
-                        for p in ca_module.parameters():
-                            p.requires_grad = False
-
-            if model_args.use_router:
-                router_module = model.get_model().get_layer_router()
-                model.config.diversity_weight = training_args.diversity_weight
-                if router_module is not None:
-                    if model_args.tune_router:
-                        for p in router_module.parameters():
-                            p.requires_grad = True
-                    else:
-                        for p in router_module.parameters():
-                            p.requires_grad = False
+            dla_module = model.get_model().get_text_dla()
+            if dla_module is not None:
+                for p in dla_module.parameters():
+                    p.requires_grad = True
+            else:
+                for p in dla_module.parameters():
+                    p.requires_grad = False
     
 
         model.config.freeze_mm_mlp_adapter = training_args.freeze_mm_mlp_adapter

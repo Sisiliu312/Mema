@@ -160,7 +160,7 @@ class LLaVATrainer(Trainer):
                 # projector_parameters = [name for name, _ in opt_model.named_parameters() if "mm_projector" in name]
                 special_lr_parameters = [
                     name for name, _ in opt_model.named_parameters() 
-                    if any(keyword in name for keyword in ["mm_projector", "ca", "layer_router"])
+                    if any(keyword in name for keyword in ["mm_projector", "text_dla"])
                 ]
                 optimizer_grouped_parameters = [
                     {

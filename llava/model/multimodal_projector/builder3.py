@@ -55,7 +55,7 @@ class SpatialGate(nn.Module):
         c_expanded = c_l.unsqueeze(1).expand(-1, x.shape[1], -1)  # [B, N, D]
         
         # 基于context生成spatial-specific gate
-        gate = self.conv(c_expanded + x)  # [B, N, D]
+        gate = self.conv(c_expanded)  # [B, N, D]
         
         return x * gate
     
@@ -69,6 +69,7 @@ class DynamicSharingUnit(nn.Module):
         self.W1 = nn.Linear(3 * dim, self.reduced_dim)
         
         # Gates
+        self.Wt = nn.Linear(dim, dim)
         self.Wc = nn.Linear(self.reduced_dim, dim)
         self.Wi = nn.Linear(self.reduced_dim, dim)
         self.Wf = nn.Linear(self.reduced_dim, dim)
@@ -82,7 +83,11 @@ class DynamicSharingUnit(nn.Module):
         c_prev_norm = torch.sigmoid(c_prev)
         
         # ✅ Early fusion: 直接concat
-        combined = torch.cat([c_prev_norm, y_l, text_global], dim=-1)
+        # combined = torch.cat([c_prev_norm, y_l, text_global], dim=-1)
+        # s = F.relu(self.W1(combined))
+
+        y_tilde = y_l + self.Wt(text_global)
+        combined = torch.cat([c_prev_norm, y_tilde], dim=-1)
         s = F.relu(self.W1(combined))  # [B, D//r]
         
         # Gates
