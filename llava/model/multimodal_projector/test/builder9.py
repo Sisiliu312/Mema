@@ -79,7 +79,8 @@ class DynamicSharingUnit(nn.Module):
         
     def forward(self, y_l, text_global, c_prev):
         # Normalize c_prev
-        c_prev_norm = torch.sigmoid(c_prev)
+        c_prev_used = c_prev.detach()
+        c_prev_norm = torch.sigmoid(c_prev_used)
         
         # ✅ Early fusion: 直接concat
         combined = torch.cat([c_prev_norm, y_l, text_global], dim=-1)
@@ -92,6 +93,7 @@ class DynamicSharingUnit(nn.Module):
         
         # Update
         c_l = f * c_prev + i * c_tilde
+        print("c_l max:", c_l.max().item(), " min:", c_l.min().item())
         
         return c_l
 
@@ -204,7 +206,9 @@ class TextConditionedDynamicLayerAttention(nn.Module):
             K = self.W_k(refreshed_feat)
             K = self.k_norm(K)
             K = K.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
-            V = refreshed_feat.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+            V = refreshed_feat
+            print("Refreshed feat max:", V.max().item(), " min:", V.min().item())
+            V = V.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
             
             K_list.append(K)
             V_list.append(V)

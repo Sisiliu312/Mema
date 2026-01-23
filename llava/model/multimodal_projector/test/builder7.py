@@ -65,8 +65,8 @@ class DynamicSharingUnit(nn.Module):
         self.dim = dim
         self.reduced_dim = dim // reduction_ratio
         
-        # ✅ 输入是 [c_{l-1}, y_l, text]
-        self.W1 = nn.Linear(3 * dim, self.reduced_dim)
+        # ✅ 输入是 [c_{l-1}, y_l]
+        self.W1 = nn.Linear(2 * dim, self.reduced_dim)
         
         # Gates
         self.Wc = nn.Linear(self.reduced_dim, dim)
@@ -77,12 +77,12 @@ class DynamicSharingUnit(nn.Module):
         self.bi = nn.Parameter(torch.zeros(dim))
         self.bf = nn.Parameter(torch.zeros(dim))
         
-    def forward(self, y_l, text_global, c_prev):
+    def forward(self, y_l, c_prev):
         # Normalize c_prev
         c_prev_norm = torch.sigmoid(c_prev)
         
         # ✅ Early fusion: 直接concat
-        combined = torch.cat([c_prev_norm, y_l, text_global], dim=-1)
+        combined = torch.cat([c_prev_norm, y_l], dim=-1)
         s = F.relu(self.W1(combined))  # [B, D//r]
         
         # Gates
@@ -174,8 +174,8 @@ class TextConditionedDynamicLayerAttention(nn.Module):
             # y_l = Pool(x^l)
             y_l = proj_feat.mean(dim=1)  # [B, feature_dim]
             
-            # c_l = DSU([y_l, text], c_{l-1})
-            c_l = self.dsu(y_l, text_global, c_prev)
+            # c_l = DSU([y_l], c_{l-1})
+            c_l = self.dsu(y_l, c_prev)
             
             contexts.append(c_l)
             c_prev = c_l  # 更新为下一层的输入

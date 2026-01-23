@@ -59,6 +59,32 @@ class SpatialGate(nn.Module):
         
         return x * gate
     
+class SpatialGate_Text(nn.Module):
+    def __init__(self, feature_dim):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Linear(feature_dim, feature_dim),
+            nn.GELU(),
+            nn.Linear(feature_dim, feature_dim),
+            nn.Sigmoid()
+        )
+        
+    def forward(self, x, t):
+        """
+        Args:
+            x: [B, N, D] - 原始特征
+            c_l: [B, D] - context
+        Returns:
+            modulated: [B, N, D]
+        """
+        # 将context广播到每个位置
+        t_expanded = t.unsqueeze(1).expand(-1, x.shape[1], -1)  # [B, N, D]
+        
+        # 基于context生成spatial-specific gate
+        gate = self.conv(t_expanded)  # [B, N, D]
+        
+        return x * gate
+    
 class DynamicSharingUnit(nn.Module):
     def __init__(self, dim, reduction_ratio=4):
         super().__init__()
@@ -114,6 +140,7 @@ class TextConditionedDynamicLayerAttention(nn.Module):
         
         # ============ 2. g(c_l): 从context生成modulation ============
         self.g = SpatialGate(feature_dim)
+        self.g_text = SpatialGate_Text(feature_dim)
         
         # ============ 3. Layer attention ============
         self.W_q = nn.Linear(feature_dim, feature_dim)
@@ -186,8 +213,10 @@ class TextConditionedDynamicLayerAttention(nn.Module):
         for layer_idx, proj_feat in enumerate(projected_layer_features):
             # ✅ 关键：用当前层的 c_l，不是 c_final！
             c_l = contexts[layer_idx]  # [B, feature_dim]
-            
-            refreshed_feat = self.g(proj_feat, c_l)
+            refreshed_feat_c = self.g(proj_feat, c_l)
+            refreshed_feat_text = self.g_text(proj_feat, text_global)
+            refreshed_feat = refreshed_feat_c + refreshed_feat_text
+
             refreshed_features.append(refreshed_feat)
         
         # ============ Step 4: Multi-Head Layer Attention ============
@@ -262,8 +291,9 @@ class TextConditionedDynamicLayerAttention(nn.Module):
                 # ✅ 方案1: 平均所有 text tokens 和 vision tokens
                 importance = attn_to_layer.mean().item()
                 
-                # ✅ 方案2: 对每个 text token，取其最关注的 vision token，再平均
-                # importance = attn_to_layer.max(dim=-1).values.mean().item()
+                # ✅ 方案2: 每层最关注的token
+                # importance_per_image_token = attn_to_layer.sum(dim=1)  # [B, N]
+                # importance = importance_per_image_token.max(dim=-1).values  # [B]
                 
                 layer_importances.append(importance)
             

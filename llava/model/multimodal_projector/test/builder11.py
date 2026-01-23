@@ -95,6 +95,12 @@ class DynamicSharingUnit(nn.Module):
         
         return c_l
 
+def clip_v(v, max_rms=5.0):
+    # v: [..., head_dim]
+    rms = v.pow(2).mean(dim=-1, keepdim=True).sqrt()
+    scale = torch.clamp(max_rms / (rms + 1e-6), max=1.0)
+    return v * scale
+
 
 class TextConditionedDynamicLayerAttention(nn.Module):
     """
@@ -205,6 +211,7 @@ class TextConditionedDynamicLayerAttention(nn.Module):
             K = self.k_norm(K)
             K = K.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
             V = refreshed_feat.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+            V = clip_v(V, max_rms=5.0)
             
             K_list.append(K)
             V_list.append(V)

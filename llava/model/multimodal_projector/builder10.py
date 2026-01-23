@@ -54,9 +54,18 @@ class SpatialGate(nn.Module):
         # 将context广播到每个位置
         c_expanded = c_l.unsqueeze(1).expand(-1, x.shape[1], -1)  # [B, N, D]
         
-        # 基于context生成spatial-specific gate
-        gate = self.conv(c_expanded)  # [B, N, D]
-        
+        gate_input = c_expanded + x
+
+        # ✅ 关键 1：去均值（防止整体偏移导致 sigmoid 饱和）
+        gate_input = gate_input - gate_input.mean(dim=-1, keepdim=True)
+
+        gate = self.conv(gate_input)
+        print("gate max:", gate.max().item(), "min:", gate.min().item())
+
+        # ✅ 关键 2：软限制 sigmoid 的极端值
+        gate = gate * 0.9 + 0.05   # gate ∈ [0.05, 0.95]
+        print("gate max", gate.max().item(), "min:", gate.min().item(),"mean:", gate.mean().item())
+
         return x * gate
     
 class DynamicSharingUnit(nn.Module):
@@ -69,7 +78,6 @@ class DynamicSharingUnit(nn.Module):
         self.W1 = nn.Linear(3 * dim, self.reduced_dim)
         
         # Gates
-        self.Wt = nn.Linear(dim, dim)
         self.Wc = nn.Linear(self.reduced_dim, dim)
         self.Wi = nn.Linear(self.reduced_dim, dim)
         self.Wf = nn.Linear(self.reduced_dim, dim)
@@ -83,11 +91,7 @@ class DynamicSharingUnit(nn.Module):
         c_prev_norm = torch.sigmoid(c_prev)
         
         # ✅ Early fusion: 直接concat
-        # combined = torch.cat([c_prev_norm, y_l, text_global], dim=-1)
-        # s = F.relu(self.W1(combined))
-
-        y_tilde = y_l + self.Wt(text_global)
-        combined = torch.cat([c_prev_norm, y_tilde], dim=-1)
+        combined = torch.cat([c_prev_norm, y_l, text_global], dim=-1)
         s = F.relu(self.W1(combined))  # [B, D//r]
         
         # Gates
@@ -97,6 +101,10 @@ class DynamicSharingUnit(nn.Module):
         
         # Update
         c_l = f * c_prev + i * c_tilde
+        print("c_l max:", c_l.max().item(), "min:", c_l.min().item(),"mean:", c_l.mean().item())
+        print("c_prev max:", c_prev.max().item(), "min:", c_prev.min().item(),"mean:", c_prev.mean().item())
+        print("f max:", f.max().item(), "min:", f.min().item(),"mean:", f.mean().item())
+        print("i max:", i.max().item(), "min:", i.min().item(),"mean:", i.mean().item())
         
         return c_l
 
@@ -132,7 +140,7 @@ class TextConditionedDynamicLayerAttention(nn.Module):
 
         # 可视化
         self.save_counter = 0
-        self.save_dir = "/dataset/TextVQA/ca_attention_weights"
+        self.save_dir = "/dataset/ca_attention_weights/attention"
         os.makedirs(self.save_dir, exist_ok=True)
         print(f"✓ Cross-Attention save dir: {self.save_dir}")
         self.layer_importance_scores = []
@@ -191,8 +199,11 @@ class TextConditionedDynamicLayerAttention(nn.Module):
         for layer_idx, proj_feat in enumerate(projected_layer_features):
             # ✅ 关键：用当前层的 c_l，不是 c_final！
             c_l = contexts[layer_idx]  # [B, feature_dim]
+            print("c_l max:", c_l.max().item(), "min:", c_l.min().item())
+            print("proj_feat max:", proj_feat.max().item(), "min:", proj_feat.min().item())
             
             refreshed_feat = self.g(proj_feat, c_l)
+            print("refreshed_feat max:", refreshed_feat.max().item(), "min:", refreshed_feat.min().item())
             refreshed_features.append(refreshed_feat)
         
         # ============ Step 4: Multi-Head Layer Attention ============
@@ -269,9 +280,6 @@ class TextConditionedDynamicLayerAttention(nn.Module):
                 
                 # ✅ 方案2: 对每个 text token，取其最关注的 vision token，再平均
                 # importance = attn_to_layer.max(dim=-1).values.mean().item()
-                
-                # ✅ 方案3: 总的 attention mass（sum 而不是 mean）
-                # importance = attn_to_layer.sum().item()
                 
                 layer_importances.append(importance)
             

@@ -59,39 +59,56 @@ class SpatialGate(nn.Module):
         
         return x * gate
     
-class DynamicSharingUnit(nn.Module):
+class HybridMemoryUnit(nn.Module):
     def __init__(self, dim, reduction_ratio=4):
         super().__init__()
-        self.dim = dim
+        
+        # Stage 1: Constraint Gate
+        self.constraint_gate = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.Sigmoid()
+        )
+        
+        # Stage 2: HMU Core
         self.reduced_dim = dim // reduction_ratio
+        self.W_fusion = nn.Linear(3 * dim, self.reduced_dim)
+        self.W_forget = nn.Linear(self.reduced_dim, dim)
+        self.W_input = nn.Linear(self.reduced_dim, dim)
+        self.W_cell = nn.Linear(self.reduced_dim, dim)
         
-        # ✅ 输入是 [c_{l-1}, y_l, text]
-        self.W1 = nn.Linear(3 * dim, self.reduced_dim)
-        
-        # Gates
-        self.Wc = nn.Linear(self.reduced_dim, dim)
-        self.Wi = nn.Linear(self.reduced_dim, dim)
-        self.Wf = nn.Linear(self.reduced_dim, dim)
-        
-        self.bc = nn.Parameter(torch.zeros(dim))
-        self.bi = nn.Parameter(torch.zeros(dim))
-        self.bf = nn.Parameter(torch.zeros(dim))
+        # Stage 3: Correction Gate
+        self.correction_gate = nn.Sequential(
+            nn.Linear(3 * dim, dim),  # ✅ 改成3路输入
+            nn.ReLU(),
+            nn.Linear(dim, dim),
+            nn.Sigmoid()
+        )
         
     def forward(self, y_l, text_global, c_prev):
-        # Normalize c_prev
-        c_prev_norm = torch.sigmoid(c_prev)
+        # Stage 1: 稳定化
+        drift = y_l - c_prev
+        drift_gate = self.constraint_gate(drift)
+        # y_l_stable = drift_gate * y_l + (1 - drift_gate) * c_prev
+        y_l_stable = drift_gate * c_prev + (1 - drift_gate) * y_l
         
-        # ✅ Early fusion: 直接concat
-        combined = torch.cat([c_prev_norm, y_l, text_global], dim=-1)
-        s = F.relu(self.W1(combined))  # [B, D//r]
+        # Stage 2: HMU更新
+        c_prev_norm = torch.sigmoid(c_prev)  # ✅ 用sigmoid
+        combined = torch.cat([c_prev_norm, y_l_stable, text_global], dim=-1)
+        s = F.relu(self.W_fusion(combined))
         
-        # Gates
-        c_tilde = torch.tanh(self.Wc(s) + self.bc)
-        i = torch.sigmoid(self.Wi(s) + self.bi)
-        f = torch.sigmoid(self.Wf(s) + self.bf)
+        f = torch.sigmoid(self.W_forget(s))
+        i = torch.sigmoid(self.W_input(s))
+        c_tilde = torch.tanh(self.W_cell(s))
         
-        # Update
-        c_l = f * c_prev + i * c_tilde
+        c_l_candidate = f * c_prev + i * c_tilde
+        
+        # Stage 3: 自适应输出
+        # ✅ 三路输入: [c_prev, c_candidate, y_l_stable]
+        gate_input = torch.cat([c_prev, c_l_candidate, y_l_stable], dim=-1)
+        g_e = self.correction_gate(gate_input)
+        
+        # ✅ 在候选和历史之间插值
+        c_l = g_e * c_l_candidate + (1 - g_e) * c_prev
         
         return c_l
 
@@ -109,8 +126,8 @@ class TextConditionedDynamicLayerAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = feature_dim // num_heads
         
-        # ============ 1. DSU for context extraction ============
-        self.dsu = DynamicSharingUnit(feature_dim, reduction_ratio)
+        # ============ 1. HMU for context extraction ============
+        self.hmu = HybridMemoryUnit(feature_dim, reduction_ratio)
         
         # ============ 2. g(c_l): 从context生成modulation ============
         self.g = SpatialGate(feature_dim)
@@ -135,7 +152,7 @@ class TextConditionedDynamicLayerAttention(nn.Module):
         self._reset_parameters()
     
     def _reset_parameters(self):
-        for m in self.dsu.modules():
+        for m in self.hmu.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight, gain=0.5)
                 if m.bias is not None:
@@ -174,8 +191,8 @@ class TextConditionedDynamicLayerAttention(nn.Module):
             # y_l = Pool(x^l)
             y_l = proj_feat.mean(dim=1)  # [B, feature_dim]
             
-            # c_l = DSU([y_l, text], c_{l-1})
-            c_l = self.dsu(y_l, text_global, c_prev)
+            # c_l = HMU([y_l, text], c_{l-1})
+            c_l = self.hmu(y_l, text_global, c_prev)
             
             contexts.append(c_l)
             c_prev = c_l  # 更新为下一层的输入

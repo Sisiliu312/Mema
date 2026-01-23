@@ -33,31 +33,49 @@ class SimpleResBlock(nn.Module):
         x = self.pre_norm(x)
         return x + self.proj(x)
     
-class SpatialGate(nn.Module):
+class IntensityModulatedSpatialGate(nn.Module):
+    """
+    Text控制gate的"强度"，但做得更精细
+    """
     def __init__(self, feature_dim):
         super().__init__()
-        self.conv = nn.Sequential(
+        
+        # Context-based gate
+        self.gate_net = nn.Sequential(
             nn.Linear(feature_dim, feature_dim),
             nn.GELU(),
             nn.Linear(feature_dim, feature_dim),
             nn.Sigmoid()
         )
         
-    def forward(self, x, c_l):
-        """
-        Args:
-            x: [B, N, D] - 原始特征
-            c_l: [B, D] - context
-        Returns:
-            modulated: [B, N, D]
-        """
-        # 将context广播到每个位置
-        c_expanded = c_l.unsqueeze(1).expand(-1, x.shape[1], -1)  # [B, N, D]
+        # ✅ Text → 位置相关的confidence
+        # 不是单个scalar，而是[B, D]的向量
+        self.text_conf_net = nn.Sequential(
+            nn.Linear(feature_dim, feature_dim // 4),
+            nn.GELU(),
+            nn.Linear(feature_dim // 4, feature_dim),
+            nn.Sigmoid()
+        )
         
-        # 基于context生成spatial-specific gate
-        gate = self.conv(c_expanded + x)  # [B, N, D]
+    def forward(self, x, c_l, text_global):
+        B, N, D = x.shape
         
-        return x * gate
+        # ✅ 步骤1: 基于context生成base gate
+        c_expanded = c_l.unsqueeze(1).expand(-1, N, -1)
+        base_gate = self.gate_net(x + c_expanded)  # [B, N, D]
+        
+        # ✅ 步骤2: Text生成channel-wise confidence
+        conf = self.text_conf_net(text_global)  # [B, D]
+        conf_exp = conf.unsqueeze(1)  # [B, 1, D]
+        
+        # ✅ 步骤3: 调制gate强度
+        # conf接近1: 完全应用gate
+        # conf接近0: gate失效，保持原始x
+        effective_gate = conf_exp * base_gate + (1 - conf_exp) * 1.0
+        
+        x_refreshed = x * effective_gate
+        
+        return x_refreshed
     
 class DynamicSharingUnit(nn.Module):
     def __init__(self, dim, reduction_ratio=4):
@@ -113,7 +131,7 @@ class TextConditionedDynamicLayerAttention(nn.Module):
         self.dsu = DynamicSharingUnit(feature_dim, reduction_ratio)
         
         # ============ 2. g(c_l): 从context生成modulation ============
-        self.g = SpatialGate(feature_dim)
+        self.g = IntensityModulatedSpatialGate(feature_dim)
         
         # ============ 3. Layer attention ============
         self.W_q = nn.Linear(feature_dim, feature_dim)
@@ -187,7 +205,7 @@ class TextConditionedDynamicLayerAttention(nn.Module):
             # ✅ 关键：用当前层的 c_l，不是 c_final！
             c_l = contexts[layer_idx]  # [B, feature_dim]
             
-            refreshed_feat = self.g(proj_feat, c_l)
+            refreshed_feat = self.g(proj_feat, c_l, text_global)
             refreshed_features.append(refreshed_feat)
         
         # ============ Step 4: Multi-Head Layer Attention ============

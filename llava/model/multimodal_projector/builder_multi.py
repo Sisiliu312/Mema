@@ -56,6 +56,11 @@ class SpatialGate(nn.Module):
         
         # 基于context生成spatial-specific gate
         gate = self.conv(c_expanded + x)  # [B, N, D]
+        # print("gate max:", gate.max().item(), "min:", gate.min().item())
+        # num_total = gate.numel()
+        # num_zeros = (gate < 1e-3).sum().item()
+        # num_ones  = (gate > 1-1e-3).sum().item()
+        # print(f"gate zero% = {num_zeros/num_total*100:.2f}%, one% = {num_ones/num_total*100:.2f}%")
         
         return x * gate
     
@@ -92,6 +97,10 @@ class DynamicSharingUnit(nn.Module):
         
         # Update
         c_l = f * c_prev + i * c_tilde
+        # print("c_l max:", c_l.max().item(), "min:", c_l.min().item(), "mean:", c_l.mean().item())
+        # print("c_tilde max:", c_tilde.max().item(), "min:", c_tilde.min().item(), "mean:", c_tilde.mean().item())
+        # print("i max:", i.max().item(), "min:", i.min().item(), "mean:", i.mean().item())
+        # print("f max:", f.max().item(), "min:", f.min().item(), "mean:", f.mean().item())
         
         return c_l
 
@@ -125,21 +134,57 @@ class TextConditionedDynamicLayerAttention(nn.Module):
         self.k_norm = nn.LayerNorm(feature_dim)
         self.output_norm = nn.LayerNorm(feature_dim)
 
-        # 可视化
-        self.save_counter = 0
-        self.save_dir = "/dataset/ca_attention_weights/attention"
-        os.makedirs(self.save_dir, exist_ok=True)
-        print(f"✓ Cross-Attention save dir: {self.save_dir}")
-        self.layer_importance_scores = []
+        # # 可视化
+        # self.save_counter = 0
+        # self.save_dir = "/dataset/ca_attention_weights/attention"
+        # os.makedirs(self.save_dir, exist_ok=True)
+        # print(f"✓ Cross-Attention save dir: {self.save_dir}")
+        # self.layer_importance_scores = []
         
         self._reset_parameters()
     
     def _reset_parameters(self):
-        for m in self.dsu.modules():
+        """
+        Initialization strategy:
+        1) All Linear layers: standard Xavier (gain=1.0) for capacity
+        2) SpatialGate: initialized to near-identity (gate ≈ 1)
+        3) DSU: forget gate biased to preserve previous context
+        """
+
+        # ===============================
+        # 1. Default initialization for all Linear layers
+        # ===============================
+        for m in self.modules():
             if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=0.5)
+                nn.init.xavier_uniform_(m.weight, gain=1.0)
                 if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
+                    nn.init.constant_(m.bias, 0.0)
+
+        # ===============================
+        # 2. SpatialGate: near-identity initialization
+        # gate(x) ≈ 1  ==>  sigmoid(bias) ≈ 1
+        # ===============================
+        # SpatialGate.conv = [Linear(0), GELU(1), Linear(2), Sigmoid(3)]
+
+        # (a) First Linear: zero weight, zero bias (no dependence on input)
+        nn.init.constant_(self.g.conv[0].weight, 0.0)
+        nn.init.constant_(self.g.conv[0].bias, 0.0)
+
+        # (b) Second Linear: zero weight, positive bias
+        # sigmoid(4.0) ≈ 0.982  → almost identity
+        nn.init.constant_(self.g.conv[2].weight, 0.0)
+        nn.init.constant_(self.g.conv[2].bias, 4.0)
+
+        # ===============================
+        # 3. DSU: stabilize memory update (LSTM-style trick)
+        # ===============================
+        # Forget gate biased toward "keep previous c"
+        nn.init.constant_(self.dsu.bf, 1.0)
+
+        # (Optional but safe) input gate slightly conservative
+        nn.init.constant_(self.dsu.bi, 0.0)
+        nn.init.constant_(self.dsu.bc, 0.0)
+
     
     def forward(self, text_features, projected_layer_features):
         """
@@ -153,15 +198,8 @@ class TextConditionedDynamicLayerAttention(nn.Module):
         B, T, _ = text_features.shape
         N = projected_layer_features[0].shape[1]
         
-        # ============ Step 0: 对齐 batch size ============
-        B_vision = projected_layer_features[0].shape[0]
-        if text_features.shape[0] == 1 and B_vision > 1:
-            text_features = text_features.expand(B_vision, -1, -1)
-            B = B_vision
-        
-        # ✅ Step 1: Text全局表示（会在每一层复用）
-        text_global = text_features.mean(dim=1)  # [B, feature_dim]
-        
+        text_global = text_features.mean(dim=1)
+
         # ✅ Step 2: Forward Path - 逐层提取context
         # c_0 初始化为0（如图片所示）
         c_prev = torch.zeros(B, self.feature_dim, 
@@ -195,6 +233,7 @@ class TextConditionedDynamicLayerAttention(nn.Module):
         Q = self.W_q(text_features)  # [B, T, feature_dim]
         Q = self.q_norm(Q)
         Q = Q.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        # print("Q max:", Q.max().item(), "min:", Q.min().item(), "mean:", Q.mean().item())
         
         # K, V from all refreshed layers
         K_list = []
@@ -204,6 +243,8 @@ class TextConditionedDynamicLayerAttention(nn.Module):
             K = self.W_k(refreshed_feat)
             K = self.k_norm(K)
             K = K.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+            # print("K max:", K.max().item(), "min:", K.min().item(), "mean:", K.mean().item())
+            # print("V max:", refreshed_feat.max().item(), "min:", refreshed_feat.min().item(), "mean:", refreshed_feat.mean().item())
             V = refreshed_feat.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
             
             K_list.append(K)
@@ -218,8 +259,8 @@ class TextConditionedDynamicLayerAttention(nn.Module):
         attn_scores = attn_scores / (self.head_dim ** 0.5)
         extra_scale = (24 ** 0.5)  # sqrt(24) ≈ 4.9
         attn_scores = attn_scores / extra_scale
+        
         attn_weights = F.softmax(attn_scores, dim=-1)
-
 
         # ============ 步骤6: 可视化 ============
         if not self.training:

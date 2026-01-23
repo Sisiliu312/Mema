@@ -34,30 +34,23 @@ class SimpleResBlock(nn.Module):
         return x + self.proj(x)
     
 class SpatialGate(nn.Module):
-    def __init__(self, feature_dim):
+    def __init__(self, feature_dim, grad_scale=0.3):
         super().__init__()
+        self.grad_scale = grad_scale
         self.conv = nn.Sequential(
             nn.Linear(feature_dim, feature_dim),
             nn.GELU(),
             nn.Linear(feature_dim, feature_dim),
-            nn.Sigmoid()
         )
-        
+
     def forward(self, x, c_l):
-        """
-        Args:
-            x: [B, N, D] - 原始特征
-            c_l: [B, D] - context
-        Returns:
-            modulated: [B, N, D]
-        """
-        # 将context广播到每个位置
-        c_expanded = c_l.unsqueeze(1).expand(-1, x.shape[1], -1)  # [B, N, D]
-        
-        # 基于context生成spatial-specific gate
-        gate = self.conv(c_expanded + x)  # [B, N, D]
-        
-        return x * gate
+        c_expanded = c_l.unsqueeze(1).expand(-1, x.shape[1], -1)
+        gate = torch.sigmoid(self.conv(c_expanded + x))
+
+        # 🔥 关键：限制 gate 的反向梯度
+        gate_for_mul = gate.detach() + (gate - gate.detach()) * self.grad_scale
+
+        return x * gate_for_mul
     
 class DynamicSharingUnit(nn.Module):
     def __init__(self, dim, reduction_ratio=4):

@@ -33,29 +33,43 @@ class SimpleResBlock(nn.Module):
         x = self.pre_norm(x)
         return x + self.proj(x)
     
-class SpatialGate(nn.Module):
+class TextAwareSpatialGate(nn.Module):
     def __init__(self, feature_dim):
         super().__init__()
-        self.conv = nn.Sequential(
+        
+        # text → vision 对齐（非常轻）
+        self.text_proj = nn.Linear(feature_dim, feature_dim, bias=False)
+        
+        # 原 SpatialGate 的 gate 网络
+        self.gate_net = nn.Sequential(
             nn.Linear(feature_dim, feature_dim),
             nn.GELU(),
             nn.Linear(feature_dim, feature_dim),
             nn.Sigmoid()
         )
-        
-    def forward(self, x, c_l):
+
+    def forward(self, x, c_l, text_global):
         """
         Args:
-            x: [B, N, D] - 原始特征
-            c_l: [B, D] - context
+            x: [B, N, D]       - 当前层 spatial features
+            c_l: [B, D]        - layer-aligned context
+            text_global: [B, D] - text global embedding
         Returns:
-            modulated: [B, N, D]
+            x_refreshed: [B, N, D]
         """
-        # 将context广播到每个位置
-        c_expanded = c_l.unsqueeze(1).expand(-1, x.shape[1], -1)  # [B, N, D]
+        B, N, D = x.shape
         
-        # 基于context生成spatial-specific gate
-        gate = self.conv(c_expanded + x)  # [B, N, D]
+        # 1. broadcast context
+        c_exp = c_l.unsqueeze(1)            # [B, 1, D]
+        
+        # 2. project text (很关键：轻量 + 不破坏结构)
+        t_proj = self.text_proj(text_global).unsqueeze(1)  # [B, 1, D]
+        
+        # 3. gate input = token + context + text hint
+        gate_input = x + c_exp + t_proj     # [B, N, D]
+        
+        # 4. spatial gate
+        gate = self.gate_net(gate_input)    # [B, N, D]
         
         return x * gate
     
@@ -113,7 +127,7 @@ class TextConditionedDynamicLayerAttention(nn.Module):
         self.dsu = DynamicSharingUnit(feature_dim, reduction_ratio)
         
         # ============ 2. g(c_l): 从context生成modulation ============
-        self.g = SpatialGate(feature_dim)
+        self.g = TextAwareSpatialGate(feature_dim)
         
         # ============ 3. Layer attention ============
         self.W_q = nn.Linear(feature_dim, feature_dim)
@@ -187,7 +201,7 @@ class TextConditionedDynamicLayerAttention(nn.Module):
             # ✅ 关键：用当前层的 c_l，不是 c_final！
             c_l = contexts[layer_idx]  # [B, feature_dim]
             
-            refreshed_feat = self.g(proj_feat, c_l)
+            refreshed_feat = self.g(proj_feat, c_l, text_global)
             refreshed_features.append(refreshed_feat)
         
         # ============ Step 4: Multi-Head Layer Attention ============

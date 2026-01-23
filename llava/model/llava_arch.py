@@ -17,9 +17,10 @@ from abc import ABC, abstractmethod
 
 import torch
 import torch.nn as nn
+from llava import conversation as conversation_lib
 
 from .multimodal_encoder.builder import build_vision_tower
-from .multimodal_projector.builder3 import build_vision_projector, build_text_conditioned_dla
+from .multimodal_projector.builder_singal_2 import build_vision_projector, build_text_conditioned_dla
 
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 
@@ -157,113 +158,40 @@ class LlavaMetaForCausalLM(ABC):
 
     def get_layer_router(self):
         return self.get_model().get_layer_router()
-        
-    def encode_images(self, images, text_token):
-        """
-        ✅ 在外部先用 mm_projector 投影所有层，再传入 DLA
-        """
-        # 获取24层特征
+
+    def encode_images(self, images):
         image_features, image_forward_outs = self.get_model().get_vision_tower()(images)
-        image_forward_outs.dtype=image_features
+        image_features = self.get_model().mm_projector(image_features)
         
-        # ============ DLA 流程 ============
         vision_layer_features = [h[:, 1:] for h in image_forward_outs.hidden_states[1:]]
         
         # ✅ Step 1: 先用 mm_projector 投影所有层
         projected_layer_features = []
         for layer_feat in vision_layer_features:
             layer_feat = layer_feat.to(image_features.dtype)
-            proj_feat = self.get_model().mm_projector(layer_feat)  # [B, N, 4096]
+            proj_feat = self.get_model().mm_projector(layer_feat)
             projected_layer_features.append(proj_feat)
-        
-        # ✅ Step 2: 准备 text
-        combined_text = torch.cat(text_token, dim=0)
-        if combined_text.dim() == 2:
-            combined_text = combined_text.unsqueeze(0)
-        
-        # ✅ Step 3: 传入 DLA（已经是投影后的特征）
-        output = self.get_model().text_dla(
-            combined_text, 
-            projected_layer_features
-        )
-        
-        return output
+
+        return image_features, projected_layer_features
 
     def prepare_inputs_labels_for_multimodal(
         self, input_ids, position_ids, attention_mask, past_key_values, labels,
-        images, image_sizes=None, CA=None
+        images, image_sizes=None,
     ):
+
         vision_tower = self.get_vision_tower()
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
             return input_ids, position_ids, attention_mask, past_key_values, None, labels
-        
-        # ################################
-        origi_input_ids = input_ids
-        origi_labels = labels
-        _labels = labels
-        _position_ids = position_ids
-        _attention_mask = attention_mask
 
-        no_attention_mask = False
-        no_position_ids = False
-        no_labels =False
-
-        if attention_mask is None:
-            no_attention_mask = True
-            attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
-        else:
-            attention_mask = attention_mask.bool()
-        if position_ids is None:
-            no_position_ids = True
-            position_ids = torch.arange(0, input_ids.shape[1], dtype=torch.long, device=input_ids.device)
-        if labels is None:
-            no_labels = True
-            labels = torch.full_like(input_ids, IGNORE_INDEX)
-        
-        _input_ids = input_ids
-        input_ids = [cur_input_ids[cur_attention_mask] for cur_input_ids, cur_attention_mask in zip(input_ids, attention_mask)]
-        labels = [cur_labels[cur_attention_mask] for cur_labels, cur_attention_mask in zip(labels, attention_mask)]
-
-        new_input_embeds = []
-        new_labels = []
-        cur_image_idx = 0
-        for batch_idx, cur_input_ids in enumerate(input_ids):
-            num_images = (cur_input_ids == IMAGE_TOKEN_INDEX).sum()
-            image_token_indices = [-1] + torch.where(cur_input_ids == IMAGE_TOKEN_INDEX)[0].tolist() + [cur_input_ids.shape[0]]
-            cur_input_ids_noim = []
-            cur_labels = labels[batch_idx]
-            cur_labels_noim = []
-            for i in range(len(image_token_indices) - 1):
-                cur_input_ids_noim.append(cur_input_ids[image_token_indices[i]+1:image_token_indices[i+1]])
-                cur_labels_noim.append(cur_labels[image_token_indices[i]+1:image_token_indices[i+1]])
-            split_sizes = [x.shape[0] for x in cur_labels_noim]
-            cur_input_embeds = self.get_model().embed_tokens(torch.cat(cur_input_ids_noim))
-            cur_input_embeds_no_im = torch.split(cur_input_embeds, split_sizes, dim=0)
-
-        if self.training:  # 训练阶段
-            input_ids = origi_input_ids
-            labels = origi_labels
-
-            if no_attention_mask:
-                attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
-            else:
-                attention_mask = attention_mask.bool()
-            if no_position_ids is None:
-                position_ids = torch.arange(0, input_ids.shape[1], dtype=torch.long, device=input_ids.device)
-            if no_labels is None:
-                labels = torch.full_like(input_ids, IGNORE_INDEX)
-        else:  # 评估阶段
-            pass
-
-        # ################################
-        
+        # 处理图片
         if type(images) is list or images.ndim == 5:
             if type(images) is list:
                 images = [x.unsqueeze(0) if x.ndim == 3 else x for x in images]
             concat_images = torch.cat([image for image in images], dim=0)
-            image_features = self.encode_images(concat_images, cur_input_embeds_no_im)
+            image_features, image_forward_outs = self.encode_images(concat_images)
             split_sizes = [image.shape[0] for image in images]
             image_features = torch.split(image_features, split_sizes, dim=0)
+            image_forward_outs = [torch.split(layer, split_sizes, dim=0) for layer in image_forward_outs]
             mm_patch_merge_type = getattr(self.config, 'mm_patch_merge_type', 'flat')
             image_aspect_ratio = getattr(self.config, 'image_aspect_ratio', 'square')
             if mm_patch_merge_type == 'flat':
@@ -306,7 +234,7 @@ class LlavaMetaForCausalLM(ABC):
             else:
                 raise ValueError(f"Unexpected mm_patch_merge_type: {self.config.mm_patch_merge_type}")
         else:
-            image_features = self.encode_images(images, cur_input_embeds_no_im)
+            image_features, image_forward_outs = self.encode_images(images)
 
         # TODO: image start / end is not implemented here to support pretraining.
         if getattr(self.config, 'tune_mm_mlp_adapter', False) and getattr(self.config, 'mm_use_im_start_end', False):
@@ -318,20 +246,20 @@ class LlavaMetaForCausalLM(ABC):
         # please open an issue / submit a PR, thanks.
 
         # remove the padding using attention_mask -- FIXME
-        if self.training:
-            _labels = labels
-            _position_ids = position_ids
-            _attention_mask = attention_mask
-            if attention_mask is None:
-                attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
-            else:
-                attention_mask = attention_mask.bool()
-            if position_ids is None:
-                position_ids = torch.arange(0, input_ids.shape[1], dtype=torch.long, device=input_ids.device)
-            if labels is None:
-                labels = torch.full_like(input_ids, IGNORE_INDEX)
+        # if self.training:
+        _labels = labels
+        _position_ids = position_ids
+        _attention_mask = attention_mask
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
         else:
-            pass
+            attention_mask = attention_mask.bool()
+        if position_ids is None:
+            position_ids = torch.arange(0, input_ids.shape[1], dtype=torch.long, device=input_ids.device)
+        if labels is None:
+            labels = torch.full_like(input_ids, IGNORE_INDEX)
+        # else:
+        #     pass
 
         _input_ids = input_ids
         input_ids = [cur_input_ids[cur_attention_mask] for cur_input_ids, cur_attention_mask in zip(input_ids, attention_mask)]
@@ -341,10 +269,16 @@ class LlavaMetaForCausalLM(ABC):
         new_labels = []
         cur_image_idx = 0
         for batch_idx, cur_input_ids in enumerate(input_ids):
-            num_images = (cur_input_ids == IMAGE_TOKEN_INDEX).sum()
+            # num_images = (cur_input_ids == IMAGE_TOKEN_INDEX).sum()
+            num_images = int((cur_input_ids == IMAGE_TOKEN_INDEX).sum().item())
             if num_images == 0:
                 cur_image_features = image_features[cur_image_idx]
                 cur_input_embeds_1 = self.get_model().embed_tokens(cur_input_ids)
+                
+                kv = [layer_feat[cur_image_idx] for layer_feat in image_forward_outs]  # list(24) of [N, D]
+                refreshed_img = self.get_model().text_dla(cur_input_embeds_1, kv, force_off=(num_images == 0))
+                cur_input_embeds_1 = cur_input_embeds_1 + (refreshed_img.sum() * 0.0)
+
                 cur_input_embeds = torch.cat([cur_input_embeds_1, cur_image_features[0:0]], dim=0)
                 new_input_embeds.append(cur_input_embeds)
                 new_labels.append(labels[batch_idx])
@@ -359,9 +293,42 @@ class LlavaMetaForCausalLM(ABC):
                 cur_input_ids_noim.append(cur_input_ids[image_token_indices[i]+1:image_token_indices[i+1]])
                 cur_labels_noim.append(cur_labels[image_token_indices[i]+1:image_token_indices[i+1]])
             split_sizes = [x.shape[0] for x in cur_labels_noim]
-            cur_input_embeds = self.get_model().embed_tokens(torch.cat(cur_input_ids_noim))
-            cur_input_embeds_no_im = torch.split(cur_input_embeds, split_sizes, dim=0)
 
+            flat_text_ids = torch.cat(cur_input_ids_noim, dim=0)      # [sumT]
+            flat_text_labels = torch.cat(cur_labels_noim, dim=0)      # [sumT]
+
+            # ---- 关键：根据数据/版本决定 conditioning tokens ----
+            if conversation_lib.default_conversation.sep_style == conversation_lib.SeparatorStyle.PLAIN:
+                # plain pretrain：没有 user/assistant 区分，caption 就是 conditioning
+                question_ids = flat_text_ids
+                # print("======pretrain======")
+            else:
+                # v1/mpt finetune：用 labels 选出 instruction（IGNORE_INDEX）
+                question_mask = (flat_text_labels == IGNORE_INDEX)
+                question_ids = flat_text_ids[question_mask] if question_mask.any() else flat_text_ids[:1]
+                # print("======finetune======")
+
+            question_embeds = self.get_model().embed_tokens(question_ids)  # [Tq, D]
+
+            # print("qusetion length", question_embeds.shape)
+
+            flat_text_embeds = self.get_model().embed_tokens(flat_text_ids)  # [sumT, D]
+            # print("question + answer length", flat_text_embeds.shape)
+
+            refreshed_imgs = []
+            # ========= DLA 仅用 question_embeds 做 conditioning =========
+            if num_images > 0:
+                for j in range(num_images):
+                    kv = [layer_feat[cur_image_idx + j] for layer_feat in image_forward_outs]  # list(24) of [N, D]
+                    refreshed_img = self.get_model().text_dla(question_embeds, kv)         # [Tq, D]
+                    # print("refreshed_img shape:",refreshed_img.shape)
+
+                    refreshed_imgs.append(refreshed_img)
+
+
+            # split 回每段（用于后续插入 image tokens）
+            cur_input_embeds_no_im = list(torch.split(flat_text_embeds, split_sizes, dim=0))
+            # ===============================================================
 
             cur_new_input_embeds = []
             cur_new_labels = []
@@ -370,7 +337,7 @@ class LlavaMetaForCausalLM(ABC):
                 cur_new_input_embeds.append(cur_input_embeds_no_im[i])
                 cur_new_labels.append(cur_labels_noim[i])
                 if i < num_images:
-                    cur_image_features = image_features[cur_image_idx]
+                    cur_image_features = refreshed_imgs[i]
                     cur_image_idx += 1
                     cur_new_input_embeds.append(cur_image_features)
                     cur_new_labels.append(torch.full((cur_image_features.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))

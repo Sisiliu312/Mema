@@ -114,6 +114,7 @@ class TextConditionedDynamicLayerAttention(nn.Module):
         
         # ============ 2. g(c_l): 从context生成modulation ============
         self.g = SpatialGate(feature_dim)
+        self.g_text = SpatialGate(feature_dim)
         
         # ============ 3. Layer attention ============
         self.W_q = nn.Linear(feature_dim, feature_dim)
@@ -186,8 +187,10 @@ class TextConditionedDynamicLayerAttention(nn.Module):
         for layer_idx, proj_feat in enumerate(projected_layer_features):
             # ✅ 关键：用当前层的 c_l，不是 c_final！
             c_l = contexts[layer_idx]  # [B, feature_dim]
-            
-            refreshed_feat = self.g(proj_feat, c_l)
+            refreshed_feat_c = self.g(proj_feat, c_l)
+            refreshed_feat_text = self.g_text(proj_feat, text_global)
+            refreshed_feat = refreshed_feat_c + refreshed_feat_text
+
             refreshed_features.append(refreshed_feat)
         
         # ============ Step 4: Multi-Head Layer Attention ============
@@ -262,8 +265,9 @@ class TextConditionedDynamicLayerAttention(nn.Module):
                 # ✅ 方案1: 平均所有 text tokens 和 vision tokens
                 importance = attn_to_layer.mean().item()
                 
-                # ✅ 方案2: 对每个 text token，取其最关注的 vision token，再平均
-                # importance = attn_to_layer.max(dim=-1).values.mean().item()
+                # ✅ 方案2: 每层最关注的token
+                # importance_per_image_token = attn_to_layer.sum(dim=1)  # [B, N]
+                # importance = importance_per_image_token.max(dim=-1).values  # [B]
                 
                 layer_importances.append(importance)
             

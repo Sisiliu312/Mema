@@ -98,16 +98,20 @@ class DynamicSharingUnit(nn.Module):
 
 class TextConditionedDynamicLayerAttention(nn.Module):
     """
-    严格按照图片公式实现的 Dynamic Layer Attention
+    添加layer embedding进行层感知的 Dynamic Layer Attention
     """
     def __init__(self, feature_dim=4096, num_vision_layers=24, 
-                 num_heads=8, reduction_ratio=4):
+                 num_heads=8, reduction_ratio=4, use_layer_embedding=True):
         super().__init__()
         
         self.feature_dim = feature_dim
         self.num_vision_layers = num_vision_layers
         self.num_heads = num_heads
         self.head_dim = feature_dim // num_heads
+        self.use_layer_embedding = use_layer_embedding
+        
+
+        self.layer_embeddings = nn.Embedding(num_vision_layers, feature_dim)
         
         # ============ 1. DSU for context extraction ============
         self.dsu = DynamicSharingUnit(feature_dim, reduction_ratio)
@@ -140,6 +144,9 @@ class TextConditionedDynamicLayerAttention(nn.Module):
                 nn.init.xavier_uniform_(m.weight, gain=0.5)
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
+        
+
+        nn.init.normal_(self.layer_embeddings.weight, mean=0.0, std=0.02)
     
     def forward(self, text_features, projected_layer_features):
         """
@@ -158,6 +165,25 @@ class TextConditionedDynamicLayerAttention(nn.Module):
         if text_features.shape[0] == 1 and B_vision > 1:
             text_features = text_features.expand(B_vision, -1, -1)
             B = B_vision
+        
+        layer_ids = torch.arange(self.num_vision_layers, 
+                                device=projected_layer_features[0].device)  # [24]
+        layer_embs = self.layer_embeddings(layer_ids)  # [24, feature_dim]
+            
+        # 为每一层的feature添加对应的layer embedding
+        projected_layer_features_with_emb = []
+        for layer_idx, proj_feat in enumerate(projected_layer_features):
+            # proj_feat: [B, N, feature_dim]
+            # layer_embs[layer_idx]: [feature_dim]
+                
+            # 将layer embedding广播并加到每个token上
+            layer_emb = layer_embs[layer_idx].unsqueeze(0).unsqueeze(0)  # [1, 1, feature_dim]
+            proj_feat_with_emb = proj_feat + layer_emb  # [B, N, feature_dim]
+            
+            projected_layer_features_with_emb.append(proj_feat_with_emb)
+            
+        # 后续使用带有layer embedding的features
+        projected_layer_features = projected_layer_features_with_emb
         
         # ✅ Step 1: Text全局表示（会在每一层复用）
         text_global = text_features.mean(dim=1)  # [B, feature_dim]
@@ -281,12 +307,14 @@ def build_text_conditioned_dla(config):
     num_vision_layers = getattr(config, 'num_vision_layers', 24)
     num_heads = getattr(config, 'num_heads', 8)
     reduction_ratio = getattr(config, 'reduction_ratio', 4)
+    use_layer_embedding = getattr(config, 'use_layer_embedding', True)  # 新增参数
     
     return TextConditionedDynamicLayerAttention(
         feature_dim=feature_dim,
         num_vision_layers=num_vision_layers,
         num_heads=num_heads,
-        reduction_ratio=reduction_ratio
+        reduction_ratio=reduction_ratio,
+        use_layer_embedding=use_layer_embedding
     )
 
 def build_vision_projector(config, delay_load=False, **kwargs):

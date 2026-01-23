@@ -53,9 +53,11 @@ class SpatialGate(nn.Module):
         """
         # 将context广播到每个位置
         c_expanded = c_l.unsqueeze(1).expand(-1, x.shape[1], -1)  # [B, N, D]
+        print("c_expanded max:", c_expanded.max().item(), "min:", c_expanded.min().item(), "mean:", c_expanded.mean().item())  # Debug log
         
         # 基于context生成spatial-specific gate
         gate = self.conv(c_expanded + x)  # [B, N, D]
+        print("gate max:", gate.max().item(), "min:", gate.min().item(), "mean:", gate.mean().item())  # Debug log
         
         return x * gate
     
@@ -92,7 +94,12 @@ class DynamicSharingUnit(nn.Module):
         
         # Update
         c_l = f * c_prev + i * c_tilde
-        
+        print("c_l max:", c_l.max().item(), "min:", c_l.min().item(), "mean:", c_l.mean().item())  # Debug log
+        print("c_prev max:", c_prev.max().item(), "min:", c_prev.min().item(), "mean:", c_prev.mean().item())  # Debug log
+        print("c_tilde max:", c_tilde.max().item(), "min:", c_tilde.min().item(), "mean:", c_tilde.mean().item())  # Debug log
+        print("f max:", f.max().item(), "min:", f.min().item(), "mean:", f.mean().item())  # Debug log
+        print("i max:", i.max().item(), "min:", i.min().item(), "mean:", i.mean().item())  # Debug log
+
         return c_l
 
 
@@ -171,6 +178,7 @@ class TextConditionedDynamicLayerAttention(nn.Module):
         contexts = []  # 保存每一层的context c_l
         
         for layer_idx, proj_feat in enumerate(projected_layer_features):
+            print(f"处理第{layer_idx+1}层")  # Debug log
             # y_l = Pool(x^l)
             y_l = proj_feat.mean(dim=1)  # [B, feature_dim]
             
@@ -184,10 +192,13 @@ class TextConditionedDynamicLayerAttention(nn.Module):
         refreshed_features = []
         
         for layer_idx, proj_feat in enumerate(projected_layer_features):
+            print(f"第{layer_idx+1}层")  # Debug log
             # ✅ 关键：用当前层的 c_l，不是 c_final！
             c_l = contexts[layer_idx]  # [B, feature_dim]
-            
+            print("c_l max:", c_l.max().item(), "min:", c_l.min().item(), "mean:", c_l.mean().item())  # Debug log
+            print("proj_feat max:", proj_feat.max().item(), "min:", proj_feat.min().item(), "mean:", proj_feat.mean().item())  # Debug log
             refreshed_feat = self.g(proj_feat, c_l)
+            print("refreshed_feat max:", refreshed_feat.max().item(), "min:", refreshed_feat.min().item(), "mean:", refreshed_feat.mean().item())  # Debug log
             refreshed_features.append(refreshed_feat)
         
         # ============ Step 4: Multi-Head Layer Attention ============
@@ -195,6 +206,7 @@ class TextConditionedDynamicLayerAttention(nn.Module):
         Q = self.W_q(text_features)  # [B, T, feature_dim]
         Q = self.q_norm(Q)
         Q = Q.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        print("Q max:", Q.max().item(), "min:", Q.min().item(), "mean:", Q.mean().item())  # Debug log
         
         # K, V from all refreshed layers
         K_list = []
@@ -204,7 +216,10 @@ class TextConditionedDynamicLayerAttention(nn.Module):
             K = self.W_k(refreshed_feat)
             K = self.k_norm(K)
             K = K.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
-            V = refreshed_feat.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+            print("K max:", K.max().item(), "min:", K.min().item(), "mean:", K.mean().item())  # Debug log
+            V = refreshed_feat
+            print("V max:", V.max().item(), "min:", V.min().item(), "mean:", V.mean().item())  # Debug log
+            V = V.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
             
             K_list.append(K)
             V_list.append(V)

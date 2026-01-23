@@ -54,9 +54,18 @@ class SpatialGate(nn.Module):
         # 将context广播到每个位置
         c_expanded = c_l.unsqueeze(1).expand(-1, x.shape[1], -1)  # [B, N, D]
         
-        # 基于context生成spatial-specific gate
-        gate = self.conv(c_expanded + x)  # [B, N, D]
-        
+        gate_input = c_expanded + x
+
+        # ✅ 关键 1：去均值（防止整体偏移导致 sigmoid 饱和）
+        gate_input = gate_input - gate_input.mean(dim=-1, keepdim=True)
+
+        gate = self.conv(gate_input)
+        # print("gate max:", gate.max().item(), "min:", gate.min().item())
+
+        # ✅ 关键 2：软限制 sigmoid 的极端值
+        gate = gate * 0.96 + 0.02   # gate ∈ [0.05, 0.95]
+        # print("adjusted gate max:", gate.max().item(), "min:", gate.min().item())
+
         return x * gate
     
 class DynamicSharingUnit(nn.Module):

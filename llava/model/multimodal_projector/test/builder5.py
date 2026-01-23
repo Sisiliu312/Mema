@@ -33,46 +33,68 @@ class SimpleResBlock(nn.Module):
         x = self.pre_norm(x)
         return x + self.proj(x)
     
+class SpatialGate(nn.Module):
+    def __init__(self, feature_dim):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Linear(feature_dim, feature_dim),
+            nn.GELU(),
+            nn.Linear(feature_dim, feature_dim),
+            nn.Sigmoid()
+        )
+        
+    def forward(self, x, c_l):
+        """
+        Args:
+            x: [B, N, D] - 原始特征
+            c_l: [B, D] - context
+        Returns:
+            modulated: [B, N, D]
+        """
+        # 将context广播到每个位置
+        c_expanded = c_l.unsqueeze(1).expand(-1, x.shape[1], -1)  # [B, N, D]
+        
+        # 基于context生成spatial-specific gate
+        gate = self.conv(c_expanded + x)  # [B, N, D]
+        
+        return x * gate
+    
 class DynamicSharingUnit(nn.Module):
-    def __init__(self, dim, reduction_ratio=4, dropout=0.1):
+    def __init__(self, dim, reduction_ratio=4):
         super().__init__()
         self.dim = dim
         self.reduced_dim = dim // reduction_ratio
         
         # ✅ 输入是 [c_{l-1}, y_l, text]
-        self.W1 = nn.Linear(2 * dim, self.reduced_dim)
+        self.W1 = nn.Linear(3 * dim, self.reduced_dim)
         
         # Gates
         self.Wc = nn.Linear(self.reduced_dim, dim)
         self.Wi = nn.Linear(self.reduced_dim, dim)
         self.Wf = nn.Linear(self.reduced_dim, dim)
-        self.text_bias = nn.Linear(dim, self.reduced_dim, bias=True)
-
-        self.dropout = nn.Dropout(p=dropout)
+        
+        self.bc = nn.Parameter(torch.zeros(dim))
+        self.bi = nn.Parameter(torch.zeros(dim))
+        self.bf = nn.Parameter(torch.zeros(dim))
         
     def forward(self, y_l, text_global, c_prev):
         # Normalize c_prev
-        c_prev_norm = torch.sigmoid(c_prev)
+        c_prev_used = c_prev.detach()
+        c_prev_norm = torch.sigmoid(c_prev_used)
         
         # ✅ Early fusion: 直接concat
-        # combined = torch.cat([c_prev_norm, y_l, text_global], dim=-1)
-        # s = F.relu(self.W1(combined))  # [B, D//r]
-        s = F.relu(self.W1(torch.cat([c_prev_norm, y_l], dim=-1)))
-        s = s + self.text_bias(text_global)
-
+        combined = torch.cat([c_prev_norm, y_l, text_global], dim=-1)
+        s = F.relu(self.W1(combined))  # [B, D//r]
+        
         # Gates
-        c_tilde = torch.tanh(self.Wc(s))
-        i = torch.sigmoid(self.Wi(s))
-        f = torch.sigmoid(self.Wf(s))
+        c_tilde = torch.tanh(self.Wc(s) + self.bc)
+        i = torch.sigmoid(self.Wi(s) + self.bi)
+        f = torch.sigmoid(self.Wf(s) + self.bf)
         
         # Update
         c_l = f * c_prev + i * c_tilde
-
-        c_l_activated = torch.sigmoid(c_l)
         
-        c_l_activated = self.dropout(c_l_activated)
-        
-        return c_l_activated
+        return c_l
 
 
 class TextConditionedDynamicLayerAttention(nn.Module):
@@ -90,24 +112,23 @@ class TextConditionedDynamicLayerAttention(nn.Module):
         
         # ============ 1. DSU for context extraction ============
         self.dsu = DynamicSharingUnit(feature_dim, reduction_ratio)
-        self.layer_refresher = nn.Sequential(
-            nn.Linear(2 * feature_dim, feature_dim),
-            nn.Sigmoid()
-        )
-
-        # ============ 2. Layer attention ============
+        
+        # ============ 2. g(c_l): 从context生成modulation ============
+        self.g = SpatialGate(feature_dim)
+        
+        # ============ 3. Layer attention ============
         self.W_q = nn.Linear(feature_dim, feature_dim)
         self.W_k = nn.Linear(feature_dim, feature_dim)
         self.W_o = nn.Linear(feature_dim, feature_dim)
         
-        # ============ 3. Normalizations ============
+        # ============ 4. Normalizations ============
         self.q_norm = nn.LayerNorm(feature_dim)
         self.k_norm = nn.LayerNorm(feature_dim)
         self.output_norm = nn.LayerNorm(feature_dim)
 
         # 可视化
         self.save_counter = 0
-        self.save_dir = "/dataset/TextVQA/ca_attention_weights"
+        self.save_dir = "/dataset/ca_attention_weights/attention"
         os.makedirs(self.save_dir, exist_ok=True)
         print(f"✓ Cross-Attention save dir: {self.save_dir}")
         self.layer_importance_scores = []
@@ -120,10 +141,6 @@ class TextConditionedDynamicLayerAttention(nn.Module):
                 nn.init.xavier_uniform_(m.weight, gain=0.5)
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
-        
-        nn.init.xavier_uniform_(self.W_q.weight, gain=0.5)
-        nn.init.xavier_uniform_(self.W_k.weight, gain=0.5)
-        nn.init.xavier_uniform_(self.W_o.weight, gain=0.5)
     
     def forward(self, text_features, projected_layer_features):
         """
@@ -166,15 +183,13 @@ class TextConditionedDynamicLayerAttention(nn.Module):
         
         # ✅ Step 3: Backward Path - 用各自的context刷新每一层
         refreshed_features = []
-        c_final = contexts[-1]
-
         
         for layer_idx, proj_feat in enumerate(projected_layer_features):
-            c_expand = c_final.unsqueeze(1).expand_as(proj_feat)
-            refreshed_feat = self.layer_refresher(
-                torch.cat([proj_feat, c_expand], dim=-1)
-            )
-            proj_feat = proj_feat * refreshed_feat
+            # ✅ 关键：用当前层的 c_l，不是 c_final！
+            c_l = contexts[layer_idx]  # [B, feature_dim]
+            
+            # refreshed_feat = self.g(proj_feat, c_l)
+            refreshed_feat = self.g(proj_feat, c_l.detach())
             refreshed_features.append(refreshed_feat)
         
         # ============ Step 4: Multi-Head Layer Attention ============
@@ -251,9 +266,6 @@ class TextConditionedDynamicLayerAttention(nn.Module):
                 
                 # ✅ 方案2: 对每个 text token，取其最关注的 vision token，再平均
                 # importance = attn_to_layer.max(dim=-1).values.mean().item()
-                
-                # ✅ 方案3: 总的 attention mass（sum 而不是 mean）
-                # importance = attn_to_layer.sum().item()
                 
                 layer_importances.append(importance)
             
