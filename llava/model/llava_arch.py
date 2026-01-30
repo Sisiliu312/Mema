@@ -20,7 +20,7 @@ import torch.nn as nn
 from llava import conversation as conversation_lib
 
 from .multimodal_encoder.builder import build_vision_tower
-from .multimodal_projector.builder_singal_2 import build_vision_projector, build_text_conditioned_dla
+from .multimodal_projector.builder_sub_cfinal_select import build_vision_projector, build_text_conditioned_dla
 
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 

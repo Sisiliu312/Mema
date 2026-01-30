@@ -1,12 +1,12 @@
 #!/bin/bash
-cd /code/LLaVA-Text-Dynamic-convert
+cd /code/LLaVA-DSU
 export PYTHONWARNINGS="ignore"
 # CUDA_VISIBLE_DEVICES=0
 
 SPLIT="mmbench_dev_cn_20231003"
 
 python -m llava.eval.model_vqa_mmbench \
-    --model-path /checkpoints/llava-v1.5-text-Dyn-convert-T-123/llava-v1.5-7b \
+    --model-path /checkpoints/llava-v1.5-DSU/llava-v1.5-7b \
     --question-file /dataset/eval/mmbench_cn/$SPLIT.tsv \
     --answers-file /dataset/eval/mmbench_cn/answers/$SPLIT/llava-v1.5-7b.jsonl \
     --lang cn \

@@ -1,10 +1,10 @@
 #!/bin/bash
-cd /code/LLaVA-Text-Dynamic-convert
+cd /code/LLaVA-DSU
 export PYTHONWARNINGS="ignore"
 # CUDA_VISIBLE_DEVICES=0
 
 python -m llava.eval.model_vqa_loader \
-    --model-path /checkpoints/llava-v1.5-text-Dyn-convert-T-123/llava-v1.5-7b \
+    --model-path /checkpoints/llava-v1.5-DSU-layermix/llava-v1.5-7b \
     --question-file /dataset/eval/pope/llava_pope_test.jsonl \
     --image-folder /dataset/eval/pope/val2014 \
     --answers-file /dataset/eval/pope/answers/llava-v1.5-7b.jsonl \

@@ -1074,8 +1074,22 @@ def train(attn_implementation=None):
                     **data_module)
 
     # register_gradient_hooks(model)
-
     
+    # ====== DEBUG: print optimizer lr groups ======
+    # trainer.create_optimizer()
+    # print("\n===== Parameter → lr mapping (sample) =====")
+    # for i, group in enumerate(trainer.optimizer.param_groups):
+    #     lr = group["lr"]
+    #     wd = group.get("weight_decay", None)
+    #     for p in group["params"]:
+    #         for name, p0 in model.named_parameters():
+    #             if p is p0:
+    #                 if "text_dla" in name or name.endswith(".alpha"):
+    #                     print(f"{name:60s}  lr={lr:.2e}  wd={wd}")
+    #                 break
+    # print("==========================================\n")
+
+
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)
     else:

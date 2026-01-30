@@ -52,15 +52,9 @@ class SpatialGate(nn.Module):
             modulated: [B, N, D]
         """
         # 将context广播到每个位置
-        c_expanded = c_l.unsqueeze(1).expand(-1, x.shape[1], -1)  # [B, N, D]
-        
-        # 基于context生成spatial-specific gate
-        gate = self.conv(c_expanded + x)  # [B, N, D]
-        # print("gate max:", gate.max().item(), "min:", gate.min().item())
-        # num_total = gate.numel()
-        # num_zeros = (gate < 1e-3).sum().item()
-        # num_ones  = (gate > 1-1e-3).sum().item()
-        # print(f"gate zero% = {num_zeros/num_total*100:.2f}%, one% = {num_ones/num_total*100:.2f}%")
+        c_expanded = c_l.unsqueeze(0)
+
+        gate = self.conv(c_expanded + x)
         
         return x * gate
     
@@ -88,7 +82,7 @@ class DynamicSharingUnit(nn.Module):
         
         # ✅ Early fusion: 直接concat
         combined = torch.cat([c_prev_norm, y_l, text_global], dim=-1)
-        s = F.relu(self.W1(combined))  # [B, D//r]
+        s = F.relu(self.W1(combined))  # [D//r]
         
         # Gates
         c_tilde = torch.tanh(self.Wc(s) + self.bc)
@@ -97,10 +91,6 @@ class DynamicSharingUnit(nn.Module):
         
         # Update
         c_l = f * c_prev + i * c_tilde
-        # print("c_l max:", c_l.max().item(), "min:", c_l.min().item(), "mean:", c_l.mean().item())
-        # print("c_tilde max:", c_tilde.max().item(), "min:", c_tilde.min().item(), "mean:", c_tilde.mean().item())
-        # print("i max:", i.max().item(), "min:", i.min().item(), "mean:", i.mean().item())
-        # print("f max:", f.max().item(), "min:", f.min().item(), "mean:", f.mean().item())
         
         return c_l
 
@@ -110,83 +100,76 @@ class TextConditionedDynamicLayerAttention(nn.Module):
     严格按照图片公式实现的 Dynamic Layer Attention
     """
     def __init__(self, feature_dim=4096, num_vision_layers=24, 
-                 num_heads=8, reduction_ratio=4):
+                 num_heads=8, reduction_ratio=4, topk=128, focus_layer_idx=-2,):
         super().__init__()
         
         self.feature_dim = feature_dim
         self.num_vision_layers = num_vision_layers
         self.num_heads = num_heads
+        self.topk = topk
         self.head_dim = feature_dim // num_heads
+        self.focus_layer_idx = focus_layer_idx
         
         # ============ 1. DSU for context extraction ============
         self.dsu = DynamicSharingUnit(feature_dim, reduction_ratio)
-        
-        # ============ 2. g(c_l): 从context生成modulation ============
-        self.g = SpatialGate(feature_dim)
-        
-        # ============ 3. Layer attention ============
-        self.W_q = nn.Linear(feature_dim, feature_dim)
-        self.W_k = nn.Linear(feature_dim, feature_dim)
-        self.W_o = nn.Linear(feature_dim, feature_dim)
-        
-        # ============ 4. Normalizations ============
-        self.q_norm = nn.LayerNorm(feature_dim)
-        self.k_norm = nn.LayerNorm(feature_dim)
-        self.output_norm = nn.LayerNorm(feature_dim)
 
-        # # 可视化
-        # self.save_counter = 0
-        # self.save_dir = "/dataset/ca_attention_weights/attention"
-        # os.makedirs(self.save_dir, exist_ok=True)
-        # print(f"✓ Cross-Attention save dir: {self.save_dir}")
-        # self.layer_importance_scores = []
+        self.score_q = nn.Linear(feature_dim, feature_dim, bias=False)
+        self.score_k = nn.Linear(feature_dim, feature_dim, bias=False)
+        self.score_norm = nn.LayerNorm(feature_dim)
+
+        # 可视化
+        self.save_counter = 0
+        self.save_dir = "/dataset/ca_attention_weights/attention"
+        os.makedirs(self.save_dir, exist_ok=True)
+        print(f"✓ Cross-Attention save dir: {self.save_dir}")
+        self.layer_importance_scores = []
         
         self._reset_parameters()
     
     def _reset_parameters(self):
-        """
-        Initialization strategy:
-        1) All Linear layers: standard Xavier (gain=1.0) for capacity
-        2) SpatialGate: initialized to near-identity (gate ≈ 1)
-        3) DSU: forget gate biased to preserve previous context
-        """
-
-        # ===============================
-        # 1. Default initialization for all Linear layers
-        # ===============================
-        for m in self.modules():
+        for m in self.dsu.modules():
             if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=1.0)
+                nn.init.xavier_uniform_(m.weight, gain=0.5)
                 if m.bias is not None:
-                    nn.init.constant_(m.bias, 0.0)
+                    nn.init.constant_(m.bias, 0)
 
-        # ===============================
-        # 2. SpatialGate: near-identity initialization
-        # gate(x) ≈ 1  ==>  sigmoid(bias) ≈ 1
-        # ===============================
-        # SpatialGate.conv = [Linear(0), GELU(1), Linear(2), Sigmoid(3)]
 
-        # (a) First Linear: zero weight, zero bias (no dependence on input)
-        nn.init.constant_(self.g.conv[0].weight, 0.0)
-        nn.init.constant_(self.g.conv[0].bias, 0.0)
+    @staticmethod
+    def _alloc_topk(total_k: int, L: int, focus_idx: int):
+        """
+        分配规则：
+          focus 层拿一半（floor(total_k/2)）
+          其余层均分另一半（尽量均匀，余数从前往后补）
+        返回：k_per_layer: List[int] 长度 L
+        """
+        total_k = int(max(0, total_k))
+        if total_k == 0:
+            return [0] * L
 
-        # (b) Second Linear: zero weight, positive bias
-        # sigmoid(4.0) ≈ 0.982  → almost identity
-        nn.init.constant_(self.g.conv[2].weight, 0.0)
-        nn.init.constant_(self.g.conv[2].bias, 4.0)
+        focus_k = total_k // 2
+        rest_k = total_k - focus_k  # 另一半（含奇数时多出来的1）
 
-        # ===============================
-        # 3. DSU: stabilize memory update (LSTM-style trick)
-        # ===============================
-        # Forget gate biased toward "keep previous c"
-        nn.init.constant_(self.dsu.bf, 1.0)
+        other_layers = L - 1
+        base = rest_k // other_layers
+        rem = rest_k - base * other_layers
 
-        # (Optional but safe) input gate slightly conservative
-        nn.init.constant_(self.dsu.bi, 0.0)
-        nn.init.constant_(self.dsu.bc, 0.0)
+        k_per_layer = [base] * L
+        k_per_layer[focus_idx] = focus_k
+
+        # 把余数 rem 分给非 focus 层（从小层号开始补）
+        for li in range(L):
+            if li == focus_idx:
+                continue
+            if rem <= 0:
+                break
+            k_per_layer[li] += 1
+            rem -= 1
+
+        return k_per_layer
+
 
     
-    def forward(self, text_features, projected_layer_features):
+    def forward(self, text_features, projected_layer_features, force_off: bool = False):
         """
         Args:
             text_features: [B, T, feature_dim] - 已经过mm_projector
@@ -195,14 +178,16 @@ class TextConditionedDynamicLayerAttention(nn.Module):
         Returns:
             attended_output: [B, T, feature_dim]
         """
-        B, T, _ = text_features.shape
-        N = projected_layer_features[0].shape[1]
+        T, D = text_features.shape
+        N, _ = projected_layer_features[0].shape
+        L = len(projected_layer_features)
         
-        text_global = text_features.mean(dim=1)
-
+        # ✅ Step 1: Text全局表示（会在每一层复用）
+        text_global = F.layer_norm(text_features.mean(dim=0), (D,))
+        
         # ✅ Step 2: Forward Path - 逐层提取context
         # c_0 初始化为0（如图片所示）
-        c_prev = torch.zeros(B, self.feature_dim, 
+        c_prev = torch.zeros(self.feature_dim, 
                             device=text_features.device, 
                             dtype=text_features.dtype)
         
@@ -210,7 +195,7 @@ class TextConditionedDynamicLayerAttention(nn.Module):
         
         for layer_idx, proj_feat in enumerate(projected_layer_features):
             # y_l = Pool(x^l)
-            y_l = proj_feat.mean(dim=1)  # [B, feature_dim]
+            y_l = proj_feat.mean(dim=0)  # [B, feature_dim]
             
             # c_l = DSU([y_l, text], c_{l-1})
             c_l = self.dsu(y_l, text_global, c_prev)
@@ -218,64 +203,52 @@ class TextConditionedDynamicLayerAttention(nn.Module):
             contexts.append(c_l)
             c_prev = c_l  # 更新为下一层的输入
         
-        # ✅ Step 3: Backward Path - 用各自的context刷新每一层
-        refreshed_features = []
-        
-        for layer_idx, proj_feat in enumerate(projected_layer_features):
-            # ✅ 关键：用当前层的 c_l，不是 c_final！
-            c_l = contexts[layer_idx]  # [B, feature_dim]
-            
-            refreshed_feat = self.g(proj_feat, c_l)
-            refreshed_features.append(refreshed_feat)
-        
-        # ============ Step 4: Multi-Head Layer Attention ============
-        # Q from text
-        Q = self.W_q(text_features)  # [B, T, feature_dim]
-        Q = self.q_norm(Q)
-        Q = Q.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
-        # print("Q max:", Q.max().item(), "min:", Q.min().item(), "mean:", Q.mean().item())
-        
-        # K, V from all refreshed layers
-        K_list = []
-        V_list = []
-        
-        for refreshed_feat in refreshed_features:
-            K = self.W_k(refreshed_feat)
-            K = self.k_norm(K)
-            K = K.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
-            # print("K max:", K.max().item(), "min:", K.min().item(), "mean:", K.mean().item())
-            # print("V max:", refreshed_feat.max().item(), "min:", refreshed_feat.min().item(), "mean:", refreshed_feat.mean().item())
-            V = refreshed_feat.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
-            
-            K_list.append(K)
-            V_list.append(V)
-        
-        # Concatenate all layers
-        K_all = torch.cat(K_list, dim=2)  # [B, num_heads, 24*N, head_dim]
-        V_all = torch.cat(V_list, dim=2)
-        
-        # Attention
-        attn_scores = torch.matmul(Q, K_all.transpose(-2, -1))
-        attn_scores = attn_scores / (self.head_dim ** 0.5)
-        extra_scale = (24 ** 0.5)  # sqrt(24) ≈ 4.9
-        attn_scores = attn_scores / extra_scale
-        
-        attn_weights = F.softmax(attn_scores, dim=-1)
+        c_final = contexts[-2]                      # [D]
 
-        # ============ 步骤6: 可视化 ============
-        if not self.training:
-            self._visualize_per_image(attn_weights, N)
+        q = self.score_norm(self.score_q(c_final))                     # [D]
+
+        # ---- 分配每层的 topk ----
+        focus = self.focus_layer_idx % L  # 把 -2 变成 22
+        k_plan = self._alloc_topk(self.topk, L, focus)  # List[int], len=L
+
+        evidence_list = []
+        score_list = []
+
+        # ---- 每层独立打分 + topk，最后拼起来 ----
+        for li, patches in enumerate(projected_layer_features):
+            # patches: [N, D]
+            N = patches.shape[0]
+            k_li = min(k_plan[li], N)
+            if k_li <= 0:
+                continue
+
+            k = self.score_norm(self.score_k(patches))          # [N, D]
+            scores = (k * q.unsqueeze(0)).sum(dim=-1)           # [N]
+
+            top_scores, top_idx = torch.topk(scores, k=k_li, dim=0, largest=True, sorted=True)
+            evidence = patches.index_select(0, top_idx)         # [k_li, D]
+
+            evidence_list.append(evidence)
+            score_list.append(top_scores)
+
+        if len(evidence_list) == 0:
+            # 极端情况：topk=0 或所有层 N=0
+            evidence_tokens = torch.empty((0, D), device=text_features.device, dtype=text_features.dtype)
+        else:
+            evidence_tokens = torch.cat(evidence_list, dim=0)   # [K_total, D]
+            all_scores = torch.cat(score_list, dim=0)           # [K_total]
+
+            # 把跨层拼接后的 token 按分数再排一次序（更像“全局 topk”但保留了层配额）
+            sort_idx = torch.argsort(all_scores, descending=True)
+            evidence_tokens = evidence_tokens.index_select(0, sort_idx)
+
+
+        if force_off:
+            evidence_tokens = evidence_tokens * 0.0
+
+        # print("evidence_tokens shape:", evidence_tokens.shape)
         
-        attended = torch.matmul(attn_weights, V_all)  # [B, h, T, head_dim]
-        
-        # Reshape and project
-        attended = attended.transpose(1, 2).contiguous()
-        attended = attended.view(B, T, self.feature_dim)
-        
-        output = self.W_o(attended)
-        output = self.output_norm(output)
-        
-        return output
+        return evidence_tokens
     
     def _visualize_per_image(self, attn_weights, N):
         """

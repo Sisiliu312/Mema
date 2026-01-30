@@ -156,54 +156,145 @@ class LLaVATrainer(Trainer):
             decay_parameters = get_parameter_names(opt_model, ALL_LAYERNORM_LAYERS)
             decay_parameters = [name for name in decay_parameters if "bias" not in name]
             
+            # if self.args.mm_projector_lr is not None:
+            #     # projector_parameters = [name for name, _ in opt_model.named_parameters() if "mm_projector" in name]
+            #     special_lr_parameters = [
+            #         name for name, _ in opt_model.named_parameters() 
+            #         if any(keyword in name for keyword in ["mm_projector", "text_dla"])
+            #     ]
+            #     optimizer_grouped_parameters = [
+            #         {
+            #             "params": [
+            #                 p for n, p in opt_model.named_parameters() if (n in decay_parameters and n not in special_lr_parameters and p.requires_grad)
+            #             ],
+            #             "weight_decay": self.args.weight_decay,
+            #         },
+            #         {
+            #             "params": [
+            #                 p for n, p in opt_model.named_parameters() if (n not in decay_parameters and n not in special_lr_parameters and p.requires_grad)
+            #             ],
+            #             "weight_decay": 0.0,
+            #         },
+            #         {
+            #             "params": [
+            #                 p for n, p in opt_model.named_parameters() if (n in decay_parameters and n in special_lr_parameters and p.requires_grad)
+            #             ],
+            #             "weight_decay": self.args.weight_decay,
+            #             "lr": self.args.mm_projector_lr,
+            #         },
+            #         {
+            #             "params": [
+            #                 p for n, p in opt_model.named_parameters() if (n not in decay_parameters and n in special_lr_parameters and p.requires_grad)
+            #             ],
+            #             "weight_decay": 0.0,
+            #             "lr": self.args.mm_projector_lr,
+            #         },
+            #     ]
+            # else:
+            #     # ca_parameters = [name for name, _ in opt_model.named_parameters() if "ca" in name]
+            #     optimizer_grouped_parameters = [
+            #         {
+            #             "params": [
+            #                 p for n, p in opt_model.named_parameters() if (n in decay_parameters and p.requires_grad)
+            #             ],
+            #             "weight_decay": self.args.weight_decay,
+            #         },
+            #         {
+            #             "params": [
+            #                 p for n, p in opt_model.named_parameters() if (n not in decay_parameters and p.requires_grad)
+            #             ],
+            #             "weight_decay": 0.0,
+            #         },
+            #     ]
+
             if self.args.mm_projector_lr is not None:
                 # projector_parameters = [name for name, _ in opt_model.named_parameters() if "mm_projector" in name]
                 special_lr_parameters = [
-                    name for name, _ in opt_model.named_parameters() 
-                    if any(keyword in name for keyword in ["mm_projector", "text_dla"])
+                    n for n, _ in opt_model.named_parameters()
+                    if any(k in n for k in ["mm_projector", "text_dla"])
                 ]
+
+                # 额外：把“开关参数”单独拿出来（alpha 最关键）
+                gate_parameters = [
+                    n for n, _ in opt_model.named_parameters()
+                    if (n.endswith(".alpha") or ".alpha" in n)
+                ]
+
+                dla_lr = self.args.mm_projector_lr
+                gate_lr = getattr(self.args, "gate_lr", None)
+                if gate_lr is None:
+                    gate_lr = dla_lr * 0.1  # 默认
+
                 optimizer_grouped_parameters = [
+                    # -------- base (非 special / 非 gate) --------
                     {
-                        "params": [
-                            p for n, p in opt_model.named_parameters() if (n in decay_parameters and n not in special_lr_parameters and p.requires_grad)
-                        ],
+                        "params": [p for n, p in opt_model.named_parameters()
+                                if (n in decay_parameters and n not in special_lr_parameters and p.requires_grad)],
                         "weight_decay": self.args.weight_decay,
                     },
                     {
-                        "params": [
-                            p for n, p in opt_model.named_parameters() if (n not in decay_parameters and n not in special_lr_parameters and p.requires_grad)
-                        ],
+                        "params": [p for n, p in opt_model.named_parameters()
+                                if (n not in decay_parameters and n not in special_lr_parameters and p.requires_grad)],
                         "weight_decay": 0.0,
                     },
+
+                    # -------- dla (text_dla + mm_projector) but excluding gate_parameters --------
                     {
-                        "params": [
-                            p for n, p in opt_model.named_parameters() if (n in decay_parameters and n in special_lr_parameters and p.requires_grad)
-                        ],
+                        "params": [p for n, p in opt_model.named_parameters()
+                                if (n in decay_parameters and n in special_lr_parameters and n not in gate_parameters and p.requires_grad)],
                         "weight_decay": self.args.weight_decay,
-                        "lr": self.args.mm_projector_lr,
+                        "lr": dla_lr,
                     },
                     {
-                        "params": [
-                            p for n, p in opt_model.named_parameters() if (n not in decay_parameters and n in special_lr_parameters and p.requires_grad)
-                        ],
+                        "params": [p for n, p in opt_model.named_parameters()
+                                if (n not in decay_parameters and n in special_lr_parameters and n not in gate_parameters and p.requires_grad)],
                         "weight_decay": 0.0,
-                        "lr": self.args.mm_projector_lr,
+                        "lr": dla_lr,
+                    },
+
+                    # -------- gate (alpha / maybe Wz.bias) --------
+                    {
+                        "params": [p for n, p in opt_model.named_parameters()
+                                if (n in gate_parameters and p.requires_grad)],
+                        "weight_decay": 0.0,   # ✅ alpha 必须 0 wd
+                        "lr": gate_lr,         # ✅ 更小 lr
                     },
                 ]
+
             else:
-                # ca_parameters = [name for name, _ in opt_model.named_parameters() if "ca" in name]
+                # 仍然把 gate 参数单独拿出来（至少 wd=0）
+                gate_parameters = [
+                    n for n, _ in opt_model.named_parameters()
+                    if (n.endswith(".alpha") or ".alpha" in n)
+                ]
+
                 optimizer_grouped_parameters = [
+                    # -------- base decay (排除 gate) --------
                     {
                         "params": [
-                            p for n, p in opt_model.named_parameters() if (n in decay_parameters and p.requires_grad)
+                            p for n, p in opt_model.named_parameters()
+                            if (n in decay_parameters and n not in gate_parameters and p.requires_grad)
                         ],
                         "weight_decay": self.args.weight_decay,
                     },
+                    # -------- base no_decay (排除 gate) --------
                     {
                         "params": [
-                            p for n, p in opt_model.named_parameters() if (n not in decay_parameters and p.requires_grad)
+                            p for n, p in opt_model.named_parameters()
+                            if (n not in decay_parameters and n not in gate_parameters and p.requires_grad)
                         ],
                         "weight_decay": 0.0,
+                    },
+                    # -------- gate (alpha) --------
+                    {
+                        "params": [
+                            p for n, p in opt_model.named_parameters()
+                            if (n in gate_parameters and p.requires_grad)
+                        ],
+                        "weight_decay": 0.0,
+                        # 不写 lr => 用全局 lr（self.args.learning_rate）
+                        # 如果你想 gate 更小 lr，也可以在“只有一个lr”的模式下加一个 gate_lr：
+                        "lr": getattr(self.args, "gate_lr", self.args.learning_rate * 0.1),
                     },
                 ]
 
