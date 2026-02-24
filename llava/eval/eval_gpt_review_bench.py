@@ -25,9 +25,10 @@ def get_eval(content: str, max_tokens: int):
             )
             break
         except openai.error.RateLimitError:
+            print('[DEBUG] RateLimitError, sleep and retry...', flush=True)
             pass
         except Exception as e:
-            print(e)
+            print('[DEBUG] get_eval exception:', e, flush=True)
         time.sleep(NUM_SECONDS_TO_SLEEP)
 
     return response['choices'][0]['message']['content']
@@ -108,14 +109,18 @@ if __name__ == '__main__':
             'category': category
         }
         if idx >= len(cur_reviews):
+            print('[DEBUG] idx=%d calling OpenAI API...' % idx, flush=True)
             review = get_eval(content, args.max_tokens)
+            print('[DEBUG] idx=%d API returned' % idx, flush=True)
             scores = parse_score(review)
             cur_js['content'] = review
             cur_js['tuple'] = scores
             review_file.write(json.dumps(cur_js) + '\n')
             review_file.flush()
         else:
-            print(f'Skipping {idx} as we already have it.')
+            print(f'Skipping {idx} as we already have it.', flush=True)
         idx += 1
-        print(idx)
+        print(idx, flush=True)
+    print('[DEBUG] loop done, closing file', flush=True)
     review_file.close()
+    print('[DEBUG] eval_gpt_review_bench done', flush=True)

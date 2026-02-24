@@ -1,12 +1,12 @@
 #!/bin/bash
-cd /code/LLaVA-DSU
+cd /code/LLaVA-DSU-dynamic-multi-cl-finetune
 export PYTHONWARNINGS="ignore"
 # CUDA_VISIBLE_DEVICES=0
 
 SPLIT="mmbench_dev_20230712"
 
 python -m llava.eval.model_vqa_mmbench \
-    --model-path /checkpoints/llava-v1.5-DSU/llava-v1.5-7b \
+    --model-path /checkpoints/llava-v1.5-dynamic-multi-cl-finetune-loss/llava-v1.5-7b \
     --question-file /dataset/eval/mmbench/$SPLIT.tsv \
     --answers-file /dataset/eval/mmbench/answers/$SPLIT/llava-v1.5-7b.jsonl \
     --single-pred-prompt \

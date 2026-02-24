@@ -1,13 +1,20 @@
 import os
+import sys
 import argparse
 import json
+
+# 直接运行脚本时保证能 import llava（项目根在 sys.path）
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.dirname(_SCRIPT_DIR)
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 
 from llava.eval.m4c_evaluator import EvalAIAnswerProcessor
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--dir', type=str, default="./playground/data/eval/vqav2")
+    parser.add_argument('--dir', type=str, default="/dataset/eval/vqav2")
     parser.add_argument('--ckpt', type=str, required=True)
     parser.add_argument('--split', type=str, required=True)
     return parser.parse_args()

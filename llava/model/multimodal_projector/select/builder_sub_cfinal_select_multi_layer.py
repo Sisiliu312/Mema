@@ -64,8 +64,7 @@ class DynamicSharingUnit(nn.Module):
         self.dim = dim
         self.reduced_dim = dim // reduction_ratio
         
-        # ✅ 输入是 [c_{l-1}, y_l, text]
-        self.W1 = nn.Linear(3 * dim, self.reduced_dim)
+        self.W1 = nn.Linear(2 * dim, self.reduced_dim)
         
         # Gates
         self.Wc = nn.Linear(self.reduced_dim, dim)
@@ -80,8 +79,8 @@ class DynamicSharingUnit(nn.Module):
         # Normalize c_prev
         c_prev_norm = torch.sigmoid(c_prev)
         
-        # ✅ Early fusion: 直接concat
-        combined = torch.cat([c_prev_norm, y_l, text_global], dim=-1)
+        # 使用差异表示：改为 c_prev - y_l
+        combined = torch.cat([c_prev_norm - y_l, text_global], dim=-1)  # [D//r]
         s = F.relu(self.W1(combined))  # [D//r]
         
         # Gates
@@ -94,13 +93,67 @@ class DynamicSharingUnit(nn.Module):
         
         return c_l
 
+class AnchorResidualLayerMix(nn.Module):
+    """
+    Token-wise multi-layer mix anchored at layer anchor_idx:
+      x_mix = x_anchor + scale * sum_{l!=anchor} alpha_l * (x_l - x_anchor)
+
+    输入: layer_feats: list[L] of [N, D]
+    输出: x_mix: [N, D]
+    """
+    def __init__(self, num_layers: int = 24, anchor_idx: int = -2, init_scale: float = 0.0):
+        super().__init__()
+        self.num_layers = num_layers
+        self.anchor_idx = anchor_idx
+
+        # [L] learnable logits (shared across all tokens)
+        self.layer_logits = nn.Parameter(torch.zeros(num_layers))
+
+        # scalar scale (shape = [1])
+        self.scale = nn.Parameter(torch.tensor([float(init_scale)]))
+
+    def forward(self, layer_feats):
+        assert isinstance(layer_feats, (list, tuple)) and len(layer_feats) == self.num_layers
+        assert layer_feats[0].dim() == 2, f"expect [N,D], got {layer_feats[0].shape}"
+
+        # anchor: [N, D]
+        x_anchor = layer_feats[self.anchor_idx]
+
+        # stack -> [L, N, D]
+        x = torch.stack(layer_feats, dim=0)
+
+        # diff -> [L, N, D]
+        diff = x - x_anchor.unsqueeze(0)
+
+        # anchor position (0..L-1)
+        anchor_pos = self.anchor_idx if self.anchor_idx >= 0 else (self.num_layers + self.anchor_idx)
+
+        # mask anchor layer
+        mask = torch.ones(self.num_layers, device=self.layer_logits.device, dtype=torch.bool)
+        mask[anchor_pos] = False
+
+        # masked softmax in fp32 (stable)
+        logits_fp32 = self.layer_logits.float()                    # [L]
+        masked_logits = logits_fp32.masked_fill(~mask, float("-inf"))
+        alpha_fp32 = F.softmax(masked_logits, dim=0)               # [L]
+
+        # cast + reshape for broadcast -> [L,1,1]
+        alpha = alpha_fp32.to(diff.dtype).view(self.num_layers, 1, 1)
+
+        # weighted sum over layers -> [N, D]
+        delta = torch.sum(alpha * diff, dim=0)
+
+        # scale dtype align
+        scale = self.scale.to(delta.dtype)                         # scalar
+        x_mix = x_anchor + scale * delta
+        return x_mix
 
 class TextConditionedDynamicLayerAttention(nn.Module):
     """
     严格按照图片公式实现的 Dynamic Layer Attention
     """
     def __init__(self, feature_dim=4096, num_vision_layers=24, 
-                 num_heads=8, reduction_ratio=4, topk=128):
+                 num_heads=8, reduction_ratio=4, topk=128, focus_layer_idx=-2):
         super().__init__()
         
         self.feature_dim = feature_dim
@@ -108,9 +161,11 @@ class TextConditionedDynamicLayerAttention(nn.Module):
         self.num_heads = num_heads
         self.topk = topk
         self.head_dim = feature_dim // num_heads
+        self.focus_layer_idx = focus_layer_idx
         
         # ============ 1. DSU for context extraction ============
         self.dsu = DynamicSharingUnit(feature_dim, reduction_ratio)
+        self.layer_mix = AnchorResidualLayerMix(num_layers=24, anchor_idx=-2, init_scale=0.0)
 
         self.score_q = nn.Linear(feature_dim, feature_dim, bias=False)
         self.score_k = nn.Linear(feature_dim, feature_dim, bias=False)
@@ -131,6 +186,50 @@ class TextConditionedDynamicLayerAttention(nn.Module):
                 nn.init.xavier_uniform_(m.weight, gain=0.5)
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
+
+    @staticmethod
+    def _alloc_topk(total_k: int, L: int, focus_idx: int):
+        """
+        分配规则：
+          focus 层拿一半（floor(total_k/2)）
+          其余层均分另一半（尽量均匀，余数从前往后补）
+        返回：k_per_layer: List[int] 长度 L
+        """
+        total_k = int(max(0, total_k))
+        if total_k == 0:
+            return [0] * L
+
+        focus_k = total_k // 2
+        rest_k = total_k - focus_k  # 另一半（含奇数时多出来的1）
+
+        other_layers = L - 1
+        base = rest_k // other_layers
+        rem = rest_k - base * other_layers
+
+        k_per_layer = [base] * L
+        k_per_layer[focus_idx] = focus_k
+
+        # 把余数 rem 分给非 focus 层（从小层号开始补）
+        for li in range(L):
+            if li == focus_idx:
+                continue
+            if rem <= 0:
+                break
+            k_per_layer[li] += 1
+            rem -= 1
+
+        return k_per_layer
+
+    def _group_pool(self, fea, grid_size=24, groups_per_side=6):
+        # fea: [N, D], N=grid_size^2
+        N, D = fea.shape
+        assert N == grid_size * grid_size, f"N={N} not match {grid_size}x{grid_size}"
+        x = fea.view(grid_size, grid_size, D)
+        gs = grid_size // groups_per_side
+        x = x.view(groups_per_side, gs, groups_per_side, gs, D)  # [Gp,gs,Gp,gs,D]
+        x = x.permute(0, 2, 1, 3, 4).contiguous()               # [Gp,Gp,gs,gs,D]
+        groups = x.view(groups_per_side * groups_per_side, gs * gs, D).mean(dim=1)  # [G,D]
+        return groups
     
     def forward(self, text_features, projected_layer_features, force_off: bool = False):
         """
@@ -143,6 +242,7 @@ class TextConditionedDynamicLayerAttention(nn.Module):
         """
         T, D = text_features.shape
         N, _ = projected_layer_features[0].shape
+        L = len(projected_layer_features)
         
         # ✅ Step 1: Text全局表示（会在每一层复用）
         text_global = F.layer_norm(text_features.mean(dim=0), (D,))
@@ -171,16 +271,39 @@ class TextConditionedDynamicLayerAttention(nn.Module):
 
 
         q = self.score_norm(self.score_q(c_final))                     # [D]
-        k = self.score_norm(self.score_k(patches))           # [N,D]
-        scores = (k * q.unsqueeze(0)).sum(dim=-1)                      # [N]
 
-        # 6) top-k 证据选择（离散瓶颈）
-        K = min(self.topk, N)
-        top_scores, top_idx = torch.topk(scores, k=K, dim=0, largest=True, sorted=True)
+        # ---- 分配每层的 topk ----
+        focus = self.focus_layer_idx % L  # 把 -2 变成 22
+        k_plan = self._alloc_topk(self.topk, L, focus)  # List[int], len=L
 
-        evidence_tokens = patches.index_select(0, top_idx)   # [K,D]
+        evidence_list = []
+        score_list = []
+
+        # ---- 每层独立打分 + topk，最后拼起来 ----
+        for li, patches in enumerate(projected_layer_features):
+            # patches: [N, D]
+            N = patches.shape[0]
+            k_li = min(k_plan[li], N)
+            if k_li <= 0:
+                continue
+
+            k = self.score_norm(self.score_k(patches))          # [N, D]
+            scores = (k * q.unsqueeze(0)).sum(dim=-1)           # [N]
+
+            top_scores, top_idx = torch.topk(scores, k=k_li, dim=0, largest=True, sorted=True)
+            evidence = patches.index_select(0, top_idx)         # [k_li, D]
+
+            evidence_list.append(evidence)
+            score_list.append(top_scores)
+
+        if len(evidence_list) == 0:
+            # 极端情况：topk=0 或所有层 N=0
+            evidence_tokens = torch.empty((0, D), device=text_features.device, dtype=text_features.dtype)
+        else:
+            evidence_tokens = torch.cat(evidence_list, dim=0)   # [K_total, D]
+            all_scores = torch.cat(score_list, dim=0)           # [K_total]
+
         # print("evidence_tokens shape:", evidence_tokens.shape)
-
 
         if force_off:
             evidence_tokens = evidence_tokens * 0.0
