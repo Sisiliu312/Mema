@@ -71,13 +71,17 @@ class LlavaMistralForCausalLM(MistralForCausalLM, LlavaMetaForCausalLM):
     ) -> Union[Tuple, CausalLMOutputWithPast]:
 
         if inputs_embeds is None:
+            # 返回 9 个: (_, position_ids, attention_mask, past_key_values, inputs_embeds, labels, c_agg, answer_global, answer_valid_mask)
             (
                 input_ids,
                 position_ids,
                 attention_mask,
                 past_key_values,
                 inputs_embeds,
-                labels
+                labels,
+                _,
+                _,
+                _,
             ) = self.prepare_inputs_labels_for_multimodal(
                 input_ids,
                 position_ids,
@@ -115,13 +119,17 @@ class LlavaMistralForCausalLM(MistralForCausalLM, LlavaMetaForCausalLM):
             raise NotImplementedError("`inputs_embeds` is not supported")
 
         if images is not None:
+            # 返回 9 个
             (
-                inputs,
+                _,
                 position_ids,
                 attention_mask,
                 _,
                 inputs_embeds,
-                _
+                _,
+                _,
+                _,
+                _,
             ) = self.prepare_inputs_labels_for_multimodal(
                 inputs,
                 position_ids,

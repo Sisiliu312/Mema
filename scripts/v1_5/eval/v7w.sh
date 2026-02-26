@@ -1,10 +1,10 @@
 #!/bin/bash
-cd /code/LLaVA-DSU-dynamic-multi-cl-finetune
+cd /code/LLaVA-scvm-answerloss
 export PYTHONWARNINGS="ignore"
 # CUDA_VISIBLE_DEVICES=0
 
 python -m llava.eval.model_vqa_v7w \
-    --model-path /checkpoints/llava-v1.5-dynamic-multi-cl-finetune-loss/llava-v1.5-7b \
+    --model-path /checkpoints/llava-v1.5-scvm-answerloss/llava-v1.5-7b \
     --image-folder /dataset/eval/v7w/images \
     --question-file /dataset/eval/v7w/_telling_val_mc.jsonl \
     --answers-file /dataset/eval/v7w/answers/llava-v1.5-7b.jsonl \

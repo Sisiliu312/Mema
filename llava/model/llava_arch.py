@@ -154,35 +154,44 @@ class LlavaMetaForCausalLM(ABC):
         return self.get_model().get_layer_router()
 
     def encode_images(self, images, text_global=None, image_split_sizes=None, answer_global=None, answer_valid_mask=None):
-        """编码图像。text_global [B, 4096]、answer_global [B, 4096] 传入 vision tower。"""
-        image_features, image_forward_outs, align_loss = self.get_model().get_vision_tower()(
+        """编码图像；返回 (image_features, c_agg)。c_agg 为 c_24 经 mm_proj 后按 batch 聚合，供与 LLM last hidden 对齐。"""
+        # vision tower：CLIPVisionTower 返回 (image_features, image_forward_outs, c_24)；S2 等可能只返回 image_features
+        _ret = self.get_model().get_vision_tower()(
             images, text_global=text_global, image_split_sizes=image_split_sizes,
             answer_global=answer_global, answer_valid_mask=answer_valid_mask
         )
+        if isinstance(_ret, tuple) and len(_ret) == 2:
+            image_features, c_24 = _ret
+        else:
+            image_features = _ret[0] if isinstance(_ret, tuple) else _ret
+            c_24 = None
         image_features = self.get_model().mm_projector(image_features)
-        vision_layer_features = [h[:, 1:] for h in image_forward_outs.hidden_states[1:]]
-        projected_layer_features = []
-        for layer_feat in vision_layer_features:
-            layer_feat = layer_feat.to(image_features.dtype)
-            proj_feat = self.get_model().mm_projector(layer_feat)
-            projected_layer_features.append(proj_feat)
-
-        return image_features, projected_layer_features, align_loss
+        c_agg = None
+        if c_24 is not None:
+            # c_24 [N, D_clip] -> mm_proj -> [N, D_llm]，再按 image_split_sizes 聚合成 [B, D_llm]；与 image_features 同 dtype/device 避免 mat1/mat2 dtype 不一致
+            c_24_proj = self.get_model().mm_projector(
+                c_24.unsqueeze(1).to(dtype=image_features.dtype, device=image_features.device)
+            ).squeeze(1)
+            if image_split_sizes is not None and len(image_split_sizes) > 0:
+                c_24_list = torch.split(c_24_proj, image_split_sizes, dim=0)
+                c_agg = torch.stack([x.mean(dim=0) for x in c_24_list], dim=0)
+            else:
+                c_agg = c_24_proj
+        return image_features, c_agg
 
     def _encode_images_for_multimodal(self, images, image_sizes=None, text_global=None, answer_global=None, answer_valid_mask=None):
-        """对图片进行编码，支持 list/5维 与单张图片两种输入。传入 text_global / answer_global [B, D] 供 encode 内部使用。"""
+        """对图片进行编码，支持 list/5维 与单张图片两种输入。返回 (image_features, c_agg)。"""
         if type(images) is list or images.ndim == 5:
             if type(images) is list:
                 images = [x.unsqueeze(0) if x.ndim == 3 else x for x in images]
             concat_images = torch.cat([image for image in images], dim=0)
             image_split_sizes = [image.shape[0] for image in images]
-            image_features, image_forward_outs, align_loss = self.encode_images(
+            image_features, c_agg = self.encode_images(
                 concat_images, text_global=text_global, image_split_sizes=image_split_sizes,
                 answer_global=answer_global, answer_valid_mask=answer_valid_mask
             )
             split_sizes = [image.shape[0] for image in images]
             image_features = torch.split(image_features, split_sizes, dim=0)
-            image_forward_outs = [torch.split(layer, split_sizes, dim=0) for layer in image_forward_outs]
             mm_patch_merge_type = getattr(self.config, 'mm_patch_merge_type', 'flat')
             image_aspect_ratio = getattr(self.config, 'image_aspect_ratio', 'square')
             if mm_patch_merge_type == 'flat':
@@ -226,9 +235,8 @@ class LlavaMetaForCausalLM(ABC):
                 raise ValueError(f"Unexpected mm_patch_merge_type: {self.config.mm_patch_merge_type}")
         else:
             image_split_sizes = [images.shape[0]] if images.ndim == 4 else None
-            image_features, image_forward_outs, align_loss = self.encode_images(images, text_global=text_global, image_split_sizes=image_split_sizes, answer_global=answer_global, answer_valid_mask=answer_valid_mask)
-        return image_features, image_forward_outs, align_loss
-
+            image_features, c_agg = self.encode_images(images, text_global=text_global, image_split_sizes=image_split_sizes, answer_global=answer_global, answer_valid_mask=answer_valid_mask)
+        return image_features, c_agg
     def prepare_inputs_labels_for_multimodal(
         self, input_ids, position_ids, attention_mask, past_key_values, labels,
         images, image_sizes=None,
@@ -236,7 +244,7 @@ class LlavaMetaForCausalLM(ABC):
 
         vision_tower = self.get_vision_tower()
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
-            return input_ids, position_ids, attention_mask, past_key_values, None, labels, None
+            return input_ids, position_ids, attention_mask, past_key_values, None, labels, None, None, None
 
         # TODO: image start / end is not implemented here to support pretraining.
         if getattr(self.config, 'tune_mm_mlp_adapter', False) and getattr(self.config, 'mm_use_im_start_end', False):
@@ -284,18 +292,18 @@ class LlavaMetaForCausalLM(ABC):
             cur_labels = labels[batch_idx]
             labels_per_sample.append(cur_labels)
 
+            # 与 train.py 一致：labels==IGNORE_INDEX 为 question/instruction，!=IGNORE_INDEX 为 answer；
+            # PLAIN 为对齐阶段，通常只有 answer（无独立 question），令 question = answer 合理。
             if num_images == 0:
                 flat_text_labels = cur_labels
                 flat_text_ids = cur_input_ids
-                if conversation_lib.default_conversation.sep_style == conversation_lib.SeparatorStyle.PLAIN:
-                    question_mask_on_flat = torch.ones_like(flat_text_ids, dtype=torch.bool)
-                else:
-                    question_mask_on_flat = (flat_text_labels == IGNORE_INDEX)
-                question_ids = flat_text_ids[question_mask_on_flat]
-                if question_ids.numel() == 0:
-                    question_ids = flat_text_ids[:1]
                 answer_mask = (flat_text_labels != IGNORE_INDEX)
                 answer_ids = flat_text_ids[answer_mask] if answer_mask.any() else flat_text_ids[:1]
+                if conversation_lib.default_conversation.sep_style == conversation_lib.SeparatorStyle.PLAIN:
+                    question_ids = answer_ids  # 对齐阶段无独立 question
+                else:
+                    question_mask_on_flat = (flat_text_labels == IGNORE_INDEX)
+                    question_ids = flat_text_ids[question_mask_on_flat] if question_mask_on_flat.any() else flat_text_ids[:1]
                 split_sizes_list.append([flat_text_ids.shape[0]])
                 cur_labels_noim_list.append([cur_labels])
             else:
@@ -310,15 +318,13 @@ class LlavaMetaForCausalLM(ABC):
                 cur_labels_noim_list.append(cur_labels_noim)
                 flat_text_ids = torch.cat(cur_input_ids_noim, dim=0)
                 flat_text_labels = torch.cat(cur_labels_noim, dim=0)
+                answer_mask = (flat_text_labels != IGNORE_INDEX)
+                answer_ids = flat_text_ids[answer_mask] if answer_mask.any() else flat_text_ids[:1]
                 if conversation_lib.default_conversation.sep_style == conversation_lib.SeparatorStyle.PLAIN:
-                    question_ids = flat_text_ids
-                    answer_mask = (flat_text_labels != IGNORE_INDEX)
-                    answer_ids = flat_text_ids[answer_mask] if answer_mask.any() else flat_text_ids[:1]
+                    question_ids = answer_ids  # 对齐阶段无独立 question
                 else:
                     question_mask = (flat_text_labels == IGNORE_INDEX)
                     question_ids = flat_text_ids[question_mask] if question_mask.any() else flat_text_ids[:1]
-                    answer_mask = (flat_text_labels != IGNORE_INDEX)
-                    answer_ids = flat_text_ids[answer_mask] if answer_mask.any() else flat_text_ids[:1]
 
             flat_text_ids_list.append(flat_text_ids)
             question_ids_list.append(question_ids)
@@ -347,7 +353,7 @@ class LlavaMetaForCausalLM(ABC):
         answer_valid_mask = torch.tensor([(labels_per_sample[i] != IGNORE_INDEX).any().item() for i in range(batch_size)], device=text_global.device, dtype=torch.bool)
 
         # ----- 在得到 text_global / answer_global 后再做 image encode，并传入供 encode 内部使用 -----
-        image_features, image_forward_outs, align_loss = self._encode_images_for_multimodal(images, image_sizes, text_global=text_global, answer_global=answer_global, answer_valid_mask=answer_valid_mask)
+        image_features, c_agg = self._encode_images_for_multimodal(images, image_sizes, text_global=text_global, answer_global=answer_global, answer_valid_mask=answer_valid_mask)
 
         # ----- 第二遍：用预计算的 flat_text_embeds / question_embeds，保持与 image 拼接流程不变 -----
         new_input_embeds = []
@@ -441,7 +447,7 @@ class LlavaMetaForCausalLM(ABC):
         if _position_ids is None:
             position_ids = None
 
-        return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels, align_loss
+        return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels, c_agg, answer_global, answer_valid_mask
 
     def initialize_vision_tokenizer(self, model_args, tokenizer):
         if model_args.mm_use_im_patch_token:

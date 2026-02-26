@@ -17,7 +17,7 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-
+from llava.constants import IGNORE_INDEX
 from transformers import AutoConfig, AutoModelForCausalLM, \
                          LlamaConfig, LlamaModel, LlamaForCausalLM
 
@@ -70,7 +70,9 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         return_dict: Optional[bool] = None,
         **kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
-        align_loss = None
+        c_agg = None
+        answer_global = None
+        answer_valid_mask = None
         if inputs_embeds is None:
             (
                 input_ids,
@@ -79,7 +81,9 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 past_key_values,
                 inputs_embeds,
                 labels,
-                align_loss,
+                c_agg,
+                answer_global,
+                answer_valid_mask,
             ) = self.prepare_inputs_labels_for_multimodal(
                 input_ids,
                 position_ids,
@@ -102,11 +106,14 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict
         )
-        if getattr(outputs, 'loss', None) is not None and align_loss is not None:
-            # print("outputs.loss", outputs.loss)
-            outputs.loss = outputs.loss + align_loss
-            # print("align_loss", align_loss)
-            # print("after outputs.loss", outputs.loss)
+        # align_loss: c_sem_agg (c_24 经 mm_proj) 与 answer_global（answer token embeddings 的 mean）对齐
+        if getattr(outputs, 'loss', None) is not None and c_agg is not None and answer_global is not None and answer_valid_mask is not None and answer_valid_mask.any():
+            cos = torch.nn.functional.cosine_similarity(c_agg, answer_global, dim=-1)
+            align_loss = (1 - cos)[answer_valid_mask].mean()
+            # print(f"align_loss: {align_loss}")
+            # print(f"outputs.loss: {outputs.loss}")
+            outputs.loss = outputs.loss + 0.05 * align_loss
+            # print(f"outputs.loss after: {outputs.loss}")
         return outputs
 
     @torch.no_grad()
@@ -124,11 +131,13 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
 
         if images is not None:
             (
-                inputs,
+                _,
                 position_ids,
                 attention_mask,
                 _,
                 inputs_embeds,
+                _,
+                _,
                 _,
                 _,
             ) = self.prepare_inputs_labels_for_multimodal(

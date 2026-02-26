@@ -201,7 +201,7 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
         if getattr(trainer.args, "tune_mm_mlp_adapter", False):
             keys_to_match.append('mm_projector')
         if getattr(trainer.args, "tune_dsu", False):
-            keys_to_match.extend(['text_global_proj', 'dsu', 'spatial_gate'])
+            keys_to_match.extend(['text_global_proj', 'y_proj', 'dsu', 'spatial_gate'])
 
         if getattr(trainer.args, "use_im_start_end", False):
             keys_to_match.extend(['embed_tokens', 'embed_in'])
@@ -1014,6 +1014,7 @@ def train(attn_implementation=None):
             if vision_tower is None:
                 return
             for m in (getattr(vision_tower, "text_global_proj", None),
+                      getattr(vision_tower, "y_proj", None),
                       getattr(vision_tower, "dsu", None),
                       getattr(vision_tower, "spatial_gate", None)):
                 if m is not None:

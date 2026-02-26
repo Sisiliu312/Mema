@@ -1,8 +1,9 @@
 # !/bin/bash
-cd /code/LLaVA-DSU-dynamic-multi-cl-finetune
+cd /code/LLaVA-scvm-answerloss
 export PYTHONWARNINGS="ignore"
-export PYTHONPATH=/code/LLaVA-DSU-dynamic-multi-cl-finetune
-SPLIT="llava-v1.5-dynamic-multi-cl-finetune-loss"
+export PYTHONPATH=/code/LLaVA-scvm-answerloss
+# SPLIT="llava-v1.5-scvm-double-loss"
+SPLIT="llava-v1.5-scvm-answerloss"
 
 deepspeed --master_port 29400 --include localhost:0,1 llava/train/train_mem.py \
     --deepspeed ./scripts/zero2.json \

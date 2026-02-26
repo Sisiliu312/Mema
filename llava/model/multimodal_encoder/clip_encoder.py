@@ -11,39 +11,6 @@ import logging
 
 logging.getLogger("transformers.modeling_utils").setLevel(logging.ERROR)
 
-
-# ----- 与 projector builder 一致的 DSU + SpatialGate，用于在 CLIP 每层后做 LSTM 积累并用 c_l refresh -----
-# class SpatialGate(nn.Module):
-#     """乘法 gate：gate = conv(x + c_l)，输出 x * gate。"""
-#     def __init__(self, feature_dim):
-#         super().__init__()
-#         self.conv = nn.Sequential(
-#             nn.Linear(feature_dim, feature_dim),
-#             nn.GELU(),
-#             nn.Linear(feature_dim, feature_dim),
-#             nn.Sigmoid()
-#         )
-#         self._reset_parameters()
-
-#     def _reset_parameters(self):
-#         """近恒等初始化：让 gate 初始时接近 1，使 x * gate ≈ x。"""
-#         nn.init.constant_(self.conv[0].weight, 0.0)
-#         nn.init.constant_(self.conv[0].bias, 0.0)
-#         nn.init.constant_(self.conv[2].weight, 0.0)
-#         # 初始化 bias 为较大正数，使 sigmoid(bias) ≈ 1
-#         nn.init.constant_(self.conv[2].bias, 5.0)
-
-#     def forward(self, x, c_l):
-#         """x: [N*L, D] 或 [N, D]；c_l: [N*L, D] 或 [N, D]（与 x 同形状）"""
-#         if c_l.dim() == 1:
-#             c = c_l.unsqueeze(0).expand_as(x)
-#         else:
-#             c = c_l
-#         gate = self.conv(x + c)
-#         return x * gate
-
-
-
 class SpatialGate(nn.Module):
     def __init__(self, feature_dim, num_layers=24):
         super().__init__()
@@ -140,66 +107,34 @@ class SpatialGate(nn.Module):
 
 
 class DynamicSharingUnit(nn.Module):
-    """双通道记忆：c^tex（纹理/局部）与 c^sem（语义/全局），按深度日程混合更新。"""
+    """单 memory [N, D]，与 dynamic-image-mean-max 一致。"""
     def __init__(self, dim, reduction_ratio=4):
         super().__init__()
-        assert dim % 2 == 0, "dim 需为偶数以便 chunk(2)"
         self.dim = dim
-        self.dim_half = dim // 2
-        self.reduced_dim = max(self.dim_half // reduction_ratio, 1)
-        # tex 通道：偏局部、纹理
-        self.W1_tex = nn.Linear(3 * self.dim_half, self.reduced_dim)
-        self.Wc_tex = nn.Linear(self.reduced_dim, self.dim_half)
-        self.Wi_tex = nn.Linear(self.reduced_dim, self.dim_half)
-        self.Wf_tex = nn.Linear(self.reduced_dim, self.dim_half)
-        self.bc_tex = nn.Parameter(torch.zeros(self.dim_half))
-        self.bi_tex = nn.Parameter(torch.zeros(self.dim_half))
-        self.bf_tex = nn.Parameter(torch.zeros(self.dim_half))
-        # sem 通道：偏全局、语义
-        self.W1_sem = nn.Linear(3 * self.dim_half, self.reduced_dim)
-        self.Wc_sem = nn.Linear(self.reduced_dim, self.dim_half)
-        self.Wi_sem = nn.Linear(self.reduced_dim, self.dim_half)
-        self.Wf_sem = nn.Linear(self.reduced_dim, self.dim_half)
-        self.bc_sem = nn.Parameter(torch.zeros(self.dim_half))
-        self.bi_sem = nn.Parameter(torch.zeros(self.dim_half))
-        self.bf_sem = nn.Parameter(torch.zeros(self.dim_half))
+        self.reduced_dim = max(dim // reduction_ratio, 1)
+        self.W1 = nn.Linear(3 * dim, self.reduced_dim)
+        self.Wc = nn.Linear(self.reduced_dim, dim)
+        self.Wi = nn.Linear(self.reduced_dim, dim)
+        self.Wf = nn.Linear(self.reduced_dim, dim)
+        self.bc = nn.Parameter(torch.zeros(dim))
+        self.bi = nn.Parameter(torch.zeros(dim))
+        self.bf = nn.Parameter(torch.zeros(dim))
         self._reset_parameters()
 
     def _reset_parameters(self):
-        """LSTM 风格：forget gate 偏置 1，input gate 偏置 0。"""
-        for name in ("tex", "sem"):
-            nn.init.constant_(getattr(self, f"bf_{name}"), 1.0)
-            nn.init.constant_(getattr(self, f"bi_{name}"), 0.0)
-            nn.init.constant_(getattr(self, f"bc_{name}"), 0.0)
+        nn.init.constant_(self.bf, 1.0)
+        nn.init.constant_(self.bi, 0.0)
+        nn.init.constant_(self.bc, 0.0)
 
-    def forward(self, y_l, text_global, c_prev, layer_idx, num_layers):
-        """layer_idx: 当前层 0..L-1；num_layers: 总层数。浅层更更新 tex，深层更更新 sem。"""
-        c_prev_tex, c_prev_sem = c_prev.chunk(2, dim=-1)
-        y_tex, y_sem = y_l.chunk(2, dim=-1)
-        t_tex, t_sem = text_global.chunk(2, dim=-1)
-
-        w = layer_idx / max(num_layers - 1, 1)  # 0 -> 1，深层大
-
-        # tex 流
-        c_prev_tex_norm = F.layer_norm(c_prev_tex, (c_prev_tex.shape[-1],))
-        combined_tex = torch.cat([c_prev_tex_norm, y_tex, t_tex], dim=-1)
-        s_tex = F.relu(self.W1_tex(combined_tex))
-        c_tilde_tex = torch.tanh(self.Wc_tex(s_tex) + self.bc_tex)
-        i_tex = torch.sigmoid(self.Wi_tex(s_tex) + self.bi_tex)
-        f_tex = torch.sigmoid(self.Wf_tex(s_tex) + self.bf_tex)
-        c_tex = f_tex * c_prev_tex + (1.0 - w) * i_tex * c_tilde_tex
-
-        # sem 流
-        c_prev_sem_norm = F.layer_norm(c_prev_sem, (c_prev_sem.shape[-1],))
-        combined_sem = torch.cat([c_prev_sem_norm, y_sem, t_sem], dim=-1)
-        s_sem = F.relu(self.W1_sem(combined_sem))
-        c_tilde_sem = torch.tanh(self.Wc_sem(s_sem) + self.bc_sem)
-        i_sem = torch.sigmoid(self.Wi_sem(s_sem) + self.bi_sem)
-        f_sem = torch.sigmoid(self.Wf_sem(s_sem) + self.bf_sem)
-        c_sem = f_sem * c_prev_sem + w * i_sem * c_tilde_sem
-
-        c_l = torch.cat([c_tex, c_sem], dim=-1)
-        # print("c_l max", c_l.max(),"c_l min", c_l.min(),"c_l mean", c_l.mean())
+    def forward(self, y_l, text_global, c_prev):
+        """y_l/text_global: [N, D]；c_prev: [N, D]。返回 c_l [N, D]。"""
+        c_prev_norm = F.layer_norm(c_prev, (c_prev.shape[-1],))
+        combined = torch.cat([c_prev_norm, y_l, text_global], dim=-1)
+        s = F.relu(self.W1(combined))
+        c_tilde = torch.tanh(self.Wc(s) + self.bc)
+        i = torch.sigmoid(self.Wi(s) + self.bi)
+        f = torch.sigmoid(self.Wf(s) + self.bf)
+        c_l = f * c_prev + i * c_tilde
         return c_l
 
 
@@ -228,8 +163,9 @@ class CLIPVisionTower(nn.Module):
             self.text_global_proj = nn.Linear(self.llm_hidden_size, self.cfg_only.hidden_size)
             h = self.cfg_only.hidden_size
             num_layers = getattr(self.cfg_only, 'num_hidden_layers', 24)
+            self.y_proj = nn.Linear(3 * h, h)
             self.dsu = DynamicSharingUnit(dim=h, reduction_ratio=4)
-            self.spatial_gate = SpatialGate(h, num_layers=num_layers)
+            self.spatial_gate = SpatialGate(h)
 
     def load_model(self, device_map=None):
         if self.is_loaded:
@@ -244,17 +180,19 @@ class CLIPVisionTower(nn.Module):
         dtype = self.vision_tower.dtype
         h = self.vision_tower.config.hidden_size
 
-        # 若 delay_load 时已创建且已从 checkpoint 加载，不要用新初始化覆盖（避免覆盖 dsu/spatial_gate/text_global_proj）
+        # 若 delay_load 时已创建且已从 checkpoint 加载，不要用新初始化覆盖（避免覆盖 dsu/spatial_gate/text_global_proj/y_proj）
         if getattr(self, 'dsu', None) is not None:
             if self.text_global_proj is not None:
                 self.text_global_proj = self.text_global_proj.to(device=dev, dtype=dtype)
+            if getattr(self, 'y_proj', None) is not None:
+                self.y_proj = self.y_proj.to(device=dev, dtype=dtype)
             self.dsu = self.dsu.to(device=dev, dtype=dtype)
             self.spatial_gate = self.spatial_gate.to(device=dev, dtype=dtype)
         else:
-            num_layers = len(self.vision_tower.vision_model.encoder.layers)
             self.text_global_proj = nn.Linear(self.llm_hidden_size, h).to(device=dev, dtype=dtype)
+            self.y_proj = nn.Linear(3 * h, h).to(device=dev, dtype=dtype)
             self.dsu = DynamicSharingUnit(dim=h, reduction_ratio=4).to(device=dev, dtype=dtype)
-            self.spatial_gate = SpatialGate(h, num_layers=num_layers).to(device=dev, dtype=dtype)
+            self.spatial_gate = SpatialGate(h).to(device=dev, dtype=dtype)
         self.is_loaded = True
 
     def feature_select(self, image_forward_outs):
@@ -291,16 +229,13 @@ class CLIPVisionTower(nn.Module):
             text_global_expanded = text_global_proj.to(device=dev, dtype=dtype)
         assert text_global_expanded.shape[0] == N, "text_global 展开后应与图像数 N 一致"
 
-        # c_prev 带 batch 维 [N, D]：N 为当前 batch 的图像数，每张图一个 context 向量
+        # 单 memory [N, D]，与 dynamic-image-mean-max 一致
         c_prev = torch.zeros(N, D, device=dev, dtype=dtype)
 
         encoder_states = (hidden_states,)
         all_attentions = () if output_attentions else None
-        num_layers = len(vm.encoder.layers)
 
-        # 逐层：第 l 层用本层算出的 c_l 做 gate refresh，refresh 后的特征再输入第 l+1 层（c_1..c_24 每层一个）
         for layer_idx, encoder_layer in enumerate(vm.encoder.layers):
-            # print("第i层:", layer_idx)
             layer_outputs = encoder_layer(
                 hidden_states,
                 None,
@@ -311,16 +246,17 @@ class CLIPVisionTower(nn.Module):
             if output_attentions:
                 all_attentions = all_attentions + (layer_outputs[1],)
 
-            # 本层 l：y_l = Pool(本层输出)，c_l = DSU 双通道(tex/sem) + 深度日程
-            y_l = hidden_states.mean(dim=1)
-            c_l = self.dsu(y_l, text_global_expanded, c_prev, layer_idx=layer_idx, num_layers=num_layers)
+            # 多视角摘要 mean+max+cls 压回 D
+            mean = hidden_states.mean(dim=1)
+            maxv = hidden_states.amax(dim=1)
+            cls_tok = hidden_states[:, 0, :]
+            y_l = self.y_proj(torch.cat([mean, maxv, cls_tok], dim=-1))
+            c_l = self.dsu(y_l, text_global_expanded, c_prev)
             c_prev = c_l
-            # 用本层的 c_l 做 gate refresh，refresh 后的结果作为下一层的输入
             flat = hidden_states.reshape(N * L, D)
             c_l_flat = c_l.unsqueeze(1).expand(-1, L, -1).reshape(N * L, D)
-            refreshed = self.spatial_gate(flat, c_l_flat, layer_idx=layer_idx).reshape(N, L, D)
+            refreshed = self.spatial_gate(flat, c_l_flat).reshape(N, L, D)
             hidden_states = refreshed
-
             encoder_states = encoder_states + (hidden_states,)
 
         last_hidden_state = hidden_states
@@ -334,18 +270,17 @@ class CLIPVisionTower(nn.Module):
             hidden_states=encoder_states,
             attentions=all_attentions,
         )
-        # 返回最后一层 c_l (c_prev) 供 L_align 使用
         return image_forward_outs, c_prev
 
     def forward(self, images, text_global=None, image_split_sizes=None, answer_global=None, answer_valid_mask=None):
+        """返回 (image_features, c_sem)。c_sem 即单 memory c_24，供 mm_proj 后与 LLM last hidden 对齐。"""
         output_dir = "attention_maps/attention_layer_image1"
         os.makedirs(output_dir, exist_ok=True)
 
         text_global_proj = None
+        c_sem = None
         if text_global is not None and self.text_global_proj is not None:
-            # print("text_global shape", text_global.shape)
             text_global_proj = self.text_global_proj(text_global.to(device=self.device, dtype=self.dtype))
-            align_loss = None
         if type(images) is list:
             with torch.no_grad():
                 image_features = []
@@ -359,25 +294,15 @@ class CLIPVisionTower(nn.Module):
                     image_features.append(image_feature)
                     self._save_attention_maps(image_forward_out.attentions, idx, output_dir)
                 image_forward_outs = image_forward_out
-                align_loss = None
         else:
             if text_global_proj is not None and getattr(self, 'dsu', None) is not None:
-                image_forward_outs, c_L = self._forward_vision_with_dsu(
+                image_forward_outs, c = self._forward_vision_with_dsu(
                     images.to(device=self.device, dtype=self.dtype),
                     text_global_proj,
                     image_split_sizes=image_split_sizes,
                     output_attentions=True,
                 )
-                # auxiliary loss: L_align = 1 - cosine_similarity(c_L, a)
-                if answer_global is not None and self.text_global_proj is not None and answer_valid_mask is not None and answer_valid_mask.any():
-                    a = self.text_global_proj(answer_global.to(device=self.device, dtype=self.dtype))  # [B, D]
-                    if image_split_sizes is not None:
-                        c_L_list = torch.split(c_L, image_split_sizes, dim=0)
-                        c_L_agg = torch.stack([x.mean(dim=0) for x in c_L_list], dim=0)  # [B, D]
-                    else:
-                        c_L_agg = c_L
-                    cos = F.cosine_similarity(c_L_agg, a, dim=-1)
-                    align_loss = (1 - cos)[answer_valid_mask].mean()
+                c_sem = c  # 单 memory c_24，供 mm_proj 后与 LLM hidden 对齐
             else:
                 with torch.no_grad():
                     image_forward_outs = self.vision_tower(
@@ -388,7 +313,7 @@ class CLIPVisionTower(nn.Module):
             image_features = self.feature_select(image_forward_outs).to(images.dtype)
             self._save_attention_maps(image_forward_outs.attentions, 0, output_dir)
 
-        return image_features, image_forward_outs, align_loss
+        return image_features, c_sem
 
     def _save_attention_maps(self, attentions, image_idx, output_dir):
         """

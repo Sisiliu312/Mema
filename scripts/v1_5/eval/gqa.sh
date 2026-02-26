@@ -1,4 +1,4 @@
-cd /code/LLaVA-DSU-dynamic-multi-cl-finetune
+cd /code/LLaVA-scvm-answerloss
 export PYTHONWARNINGS="ignore"
 # CUDA_VISIBLE_DEVICES=0
 
@@ -13,7 +13,7 @@ GQADIR="/dataset/eval/gqa"
 
 for IDX in $(seq 0 $((CHUNKS-1))); do
     CUDA_VISIBLE_DEVICES=${GPULIST[$IDX]} python -m llava.eval.model_vqa_loader \
-        --model-path /checkpoints/llava-v1.5-dynamic-multi-cl-finetune-loss/llava-v1.5-7b \
+        --model-path /checkpoints/llava-v1.5-scvm-answerloss/$CKPT \
         --question-file /dataset/eval/gqa/$SPLIT.jsonl \
         --image-folder /dataset/eval/gqa/images \
         --answers-file /dataset/eval/gqa/answers/$SPLIT/$CKPT/${CHUNKS}_${IDX}.jsonl \
