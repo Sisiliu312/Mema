@@ -106,14 +106,12 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict
         )
-        # align_loss: c_sem_agg (c_24 经 mm_proj) 与 answer_global（answer token embeddings 的 mean）对齐
+        # align_loss: c_sem_agg (c_24 经 mm_proj) 与 answer_global（answer token embeddings 的 mean）对齐；系数从 config 读取（脚本 --align_loss_weight）
         if getattr(outputs, 'loss', None) is not None and c_agg is not None and answer_global is not None and answer_valid_mask is not None and answer_valid_mask.any():
             cos = torch.nn.functional.cosine_similarity(c_agg, answer_global, dim=-1)
             align_loss = (1 - cos)[answer_valid_mask].mean()
-            # print(f"align_loss: {align_loss}")
-            # print(f"outputs.loss: {outputs.loss}")
-            outputs.loss = outputs.loss + 0.05 * align_loss
-            # print(f"outputs.loss after: {outputs.loss}")
+            w = getattr(self.config, "align_loss_weight", 0.1)
+            outputs.loss = outputs.loss + w * align_loss
         return outputs
 
     @torch.no_grad()

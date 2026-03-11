@@ -11,6 +11,11 @@ def merge_lora(args):
 
     model.save_pretrained(args.save_model_path)
     tokenizer.save_pretrained(args.save_model_path)
+    if image_processor is not None:
+        try:
+            image_processor.save_pretrained(args.save_model_path)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

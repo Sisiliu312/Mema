@@ -17,4 +17,8 @@ python convert_answer_to_mme.py --experiment llava-v1.5-13b
 
 cd eval_tool
 
-python calculation.py --results_dir answers/llava-v1.5-13b 
+# 默认会输出 Perception（10 子任务）和 Cognition（4 子任务）两个子集分数
+python calculation.py --results_dir answers/llava-v1.5-13b
+
+# 仅测评 Perception 子集：python calculation.py --results_dir answers/llava-v1.5-13b --eval_type Perception
+# 仅测评 Cognition 子集：python calculation.py --results_dir answers/llava-v1.5-13b --eval_type Cognition

@@ -7,13 +7,13 @@ IFS=',' read -ra GPULIST <<< "$gpu_list"
 
 CHUNKS=${#GPULIST[@]}
 
-CKPT="llava-v1.5-7b"
+CKPT="llava-v1.5-13b"
 SPLIT="llava_gqa_testdev_balanced"
 GQADIR="/dataset/eval/gqa"
 
 for IDX in $(seq 0 $((CHUNKS-1))); do
     CUDA_VISIBLE_DEVICES=${GPULIST[$IDX]} python -m llava.eval.model_vqa_loader \
-        --model-path /checkpoints/llava-v1.5-scvm-answerloss/$CKPT \
+        --model-path /checkpoints/llava-v1.5-13b-align0.15-lr5e-5/$CKPT \
         --question-file /dataset/eval/gqa/$SPLIT.jsonl \
         --image-folder /dataset/eval/gqa/images \
         --answers-file /dataset/eval/gqa/answers/$SPLIT/$CKPT/${CHUNKS}_${IDX}.jsonl \

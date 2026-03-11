@@ -6,7 +6,7 @@ export PYTHONWARNINGS="ignore"
 SPLIT="mmbench_dev_cn_20231003"
 
 python -m llava.eval.model_vqa_mmbench \
-    --model-path /checkpoints/llava-v1.5-scvm-answerloss/llava-v1.5-7b \
+    --model-path /checkpoints/llava-v1.5-13b-align0.15-lr5e-5/llava-v1.5-13b \
     --question-file /dataset/eval/mmbench_cn/$SPLIT.tsv \
     --answers-file /dataset/eval/mmbench_cn/answers/$SPLIT/llava-v1.5-7b.jsonl \
     --lang cn \

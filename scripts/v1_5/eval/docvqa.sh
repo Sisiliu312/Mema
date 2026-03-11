@@ -11,6 +11,7 @@ python -m llava.eval.model_vqa_loader \
     --temperature 0 \
     --conv-mode vicuna_v1
 
-python -m llava.eval.eval_MP-DocVQA \
+
+python -m llava.eval.eval_from_predictions \
     --annotation-file /dataset/eval/MP-DocVQA/val.json \
     --result-file /dataset/eval/MP-DocVQA/answers/llava-v1.5-7b.jsonl

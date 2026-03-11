@@ -73,6 +73,7 @@ class ModelArguments:
     mm_use_im_patch_token: bool = field(default=True)
     mm_patch_merge_type: Optional[str] = field(default='flat')
     mm_vision_select_feature: Optional[str] = field(default="patch")
+    align_loss_weight: float = field(default=0.1, metadata={"help": "align_loss (c_agg vs answer_global) 的权重系数"})
 
 
 @dataclass
@@ -1048,6 +1049,7 @@ def train(attn_implementation=None):
         model.config.mm_projector_lr = training_args.mm_projector_lr
         training_args.use_im_start_end = model_args.mm_use_im_start_end
         model.config.mm_use_im_patch_token = model_args.mm_use_im_patch_token
+        model.config.align_loss_weight = model_args.align_loss_weight
         model.initialize_vision_tokenizer(model_args, tokenizer=tokenizer)
 
     if training_args.bits in [4, 8]:

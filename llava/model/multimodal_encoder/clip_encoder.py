@@ -32,18 +32,6 @@ class SpatialGate(nn.Module):
         nn.init.constant_(self.delta[2].bias, 0.0)
         nn.init.zeros_(self.alpha_proj.weight)
         nn.init.constant_(self.alpha_proj.bias, -2.2)  # sigmoid(-2.2) ≈ 0.1
-
-    # def forward(self, x, c_l):
-    #     """x: [N, D]; c_l: [D] 或 [N, D]（与 x 的 batch 对应，若 2D 则需与 x 同长度）"""
-    #     if c_l.dim() == 1:
-    #         c = c_l.unsqueeze(0).expand_as(x)
-    #     else:
-    #         c = c_l
-    #     h = F.layer_norm(x + c, (x.size(-1),))
-    #     delta = torch.tanh(self.delta(h))
-    #     a = torch.tanh(self.alpha)
-    #     return x + a * delta
-
     
     def forward(self, x, c_l, layer_idx=None, prefix=""):
         # x: [N, D]
@@ -292,7 +280,6 @@ class CLIPVisionTower(nn.Module):
                     )
                     image_feature = self.feature_select(image_forward_out).to(image.dtype)
                     image_features.append(image_feature)
-                    self._save_attention_maps(image_forward_out.attentions, idx, output_dir)
                 image_forward_outs = image_forward_out
         else:
             if text_global_proj is not None and getattr(self, 'dsu', None) is not None:
@@ -311,22 +298,8 @@ class CLIPVisionTower(nn.Module):
                         output_attentions=True,
                     )
             image_features = self.feature_select(image_forward_outs).to(images.dtype)
-            self._save_attention_maps(image_forward_outs.attentions, 0, output_dir)
 
         return image_features, c_sem
-
-    def _save_attention_maps(self, attentions, image_idx, output_dir):
-        """
-        只保存 CLS Token 的 Attention Map，输出形状为 (seq_len,)
-        """
-        for layer_idx, attention in enumerate(attentions):
-            # attention shape: (batch_size=1, num_heads, seq_len, seq_len)
-            attention_map = attention.mean(dim=1)  
-            # 对 num_heads 取平均，形状变为 (1, seq_len, seq_len)
-            cls_attention = attention_map[0, :, :]  
-            # 保存 CLS Attention Map
-            file_path = os.path.join(output_dir, f"image_{image_idx}_layer_{layer_idx}_cls.pt")
-            torch.save(cls_attention, file_path)
 
     @property
     def dummy_feature(self):

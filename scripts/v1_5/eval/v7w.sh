@@ -4,7 +4,7 @@ export PYTHONWARNINGS="ignore"
 # CUDA_VISIBLE_DEVICES=0
 
 python -m llava.eval.model_vqa_v7w \
-    --model-path /checkpoints/llava-v1.5-scvm-answerloss/llava-v1.5-7b \
+    --model-path /checkpoints/llava-v1.5-13b-align0.15-lr5e-5/llava-v1.5-13b \
     --image-folder /dataset/eval/v7w/images \
     --question-file /dataset/eval/v7w/_telling_val_mc.jsonl \
     --answers-file /dataset/eval/v7w/answers/llava-v1.5-7b.jsonl \
