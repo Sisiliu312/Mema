@@ -64,7 +64,7 @@ class ModelArguments:
     version: Optional[str] = field(default="v0")
     freeze_backbone: bool = field(default=False)
     tune_mm_mlp_adapter: bool = field(default=False)
-    tune_dsu: bool = field(default=False, metadata={"help": "只训练 clip_encoder 中新增的 DSU 相关模块：text_global_proj, dsu, spatial_gate"})
+    tune_dsu: bool = field(default=False, metadata={"help": "Train only DSU-related modules added in clip_encoder: text_global_proj, dsu, spatial_gate"})
     vision_tower: Optional[str] = field(default=None)
     mm_vision_select_layer: Optional[int] = field(default=-1)   # default to the last layer
     pretrain_mm_mlp_adapter: Optional[str] = field(default=None)
@@ -73,7 +73,8 @@ class ModelArguments:
     mm_use_im_patch_token: bool = field(default=True)
     mm_patch_merge_type: Optional[str] = field(default='flat')
     mm_vision_select_feature: Optional[str] = field(default="patch")
-    align_loss_weight: float = field(default=0.1, metadata={"help": "align_loss (c_agg vs answer_global) 的权重系数"})
+    align_loss_weight: float = field(default=0.1, metadata={"help": "Weight coefficient for align_loss (c_agg vs answer_global)"})
+    dsu_reduction_ratio: int = field(default=4, metadata={"help": "Reduction ratio of DSU (DynamicSharingUnit) in the CLIP vision tower"})
 
 
 @dataclass
@@ -197,28 +198,38 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
     """Collects the state dict and dump to disk."""
 
     if getattr(trainer.args, "tune_mm_mlp_adapter", False) or getattr(trainer.args, "tune_dsu", False):
-        # Only save Adapter：tune_mm_mlp_adapter 时保存 mm_projector；tune_dsu 时保存 text_global_proj/dsu/spatial_gate
-        keys_to_match = []
+        # Strict split save: mm_projector.bin stores only mm-related weights;
+        # Mema.bin stores only DSU-related weights.
+        mm_keys_to_match = []
+        mema_keys_to_match = []
         if getattr(trainer.args, "tune_mm_mlp_adapter", False):
-            keys_to_match.append('mm_projector')
+            mm_keys_to_match.append('mm_projector')
         if getattr(trainer.args, "tune_dsu", False):
-            keys_to_match.extend(['text_global_proj', 'y_proj', 'dsu', 'spatial_gate'])
-
+            mema_keys_to_match.extend(['text_global_proj', 'y_proj', 'dsu', 'spatial_gate'])
         if getattr(trainer.args, "use_im_start_end", False):
-            keys_to_match.extend(['embed_tokens', 'embed_in'])
+            mm_keys_to_match.extend(['embed_tokens', 'embed_in'])
 
-        weight_to_save = get_mm_adapter_state_maybe_zero_3(trainer.model.named_parameters(), keys_to_match)
+        mm_weight_to_save = get_mm_adapter_state_maybe_zero_3(trainer.model.named_parameters(), mm_keys_to_match) if mm_keys_to_match else {}
+        mema_weight_to_save = get_mm_adapter_state_maybe_zero_3(trainer.model.named_parameters(), mema_keys_to_match) if mema_keys_to_match else {}
         trainer.model.config.save_pretrained(output_dir)
 
         current_folder = output_dir.split('/')[-1]
         parent_folder = os.path.dirname(output_dir)
         if trainer.args.local_rank == 0 or trainer.args.local_rank == -1:
             if current_folder.startswith('checkpoint-'):
-                mm_projector_folder = os.path.join(parent_folder, "mm_projector")
-                os.makedirs(mm_projector_folder, exist_ok=True)
-                torch.save(weight_to_save, os.path.join(mm_projector_folder, f'{current_folder}.bin'))
+                if mm_weight_to_save:
+                    mm_projector_folder = os.path.join(parent_folder, "mm_projector")
+                    os.makedirs(mm_projector_folder, exist_ok=True)
+                    torch.save(mm_weight_to_save, os.path.join(mm_projector_folder, f'{current_folder}.bin'))
+                if mema_weight_to_save:
+                    mema_folder = os.path.join(parent_folder, "Mema")
+                    os.makedirs(mema_folder, exist_ok=True)
+                    torch.save(mema_weight_to_save, os.path.join(mema_folder, f'{current_folder}.bin'))
             else:
-                torch.save(weight_to_save, os.path.join(output_dir, f'mm_projector.bin'))
+                if mm_weight_to_save:
+                    torch.save(mm_weight_to_save, os.path.join(output_dir, 'mm_projector.bin'))
+                if mema_weight_to_save:
+                    torch.save(mema_weight_to_save, os.path.join(output_dir, 'Mema.bin'))
 
         return
 
@@ -800,7 +811,7 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
 
 
 # def register_gradient_hooks(model):
-#     """为不同模块设置不同的梯度放大系数"""
+#     """Set different gradient scaling factors for different modules."""
 #     for name, param in model.named_parameters():
 #         if not param.requires_grad:
 #             continue
@@ -827,7 +838,7 @@ def register_gradient_hooks(model):
         param.register_hook(make_hook(name))
 
 def find_tensors_recursive(obj, path="root"):
-    """递归查找所有 Tensor"""
+    """Recursively find all Tensor objects."""
     if isinstance(obj, torch.Tensor):
         print(f"  ⚠️ Found Tensor at {path}: shape={obj.shape}, device={obj.device}")
         return True
@@ -885,6 +896,7 @@ def train(attn_implementation=None):
         if 'mpt' in model_args.model_name_or_path:
             config = transformers.AutoConfig.from_pretrained(model_args.model_name_or_path, trust_remote_code=True)
             config.attn_config['attn_impl'] = training_args.mpt_attn_impl
+            config.dsu_reduction_ratio = model_args.dsu_reduction_ratio
             model = LlavaMptForCausalLM.from_pretrained(
                 model_args.model_name_or_path,
                 config=config,
@@ -892,8 +904,14 @@ def train(attn_implementation=None):
                 **bnb_model_from_pretrained_args
             )
         else:
+            llava_config = LlavaConfig.from_pretrained(
+                model_args.model_name_or_path,
+                cache_dir=training_args.cache_dir,
+            )
+            llava_config.dsu_reduction_ratio = model_args.dsu_reduction_ratio
             model = LlavaLlamaForCausalLM.from_pretrained(
                 model_args.model_name_or_path,
+                config=llava_config,
                 cache_dir=training_args.cache_dir,
                 attn_implementation=attn_implementation,
                 torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
@@ -901,7 +919,7 @@ def train(attn_implementation=None):
             )
             # print(model)
             # print("-=-=-=-=-=-from_pretrained-=-=-=-=-=-=-=-")
-            # print(f"🔍 from_pretrained 后:")
+            # print(f"🔍 after from_pretrained:")
             # print(f"  hasattr(model.model, 'ca'): {hasattr(model.model, 'ca')}")
             # print(f"  hasattr(model.model, 'layer_router'): {hasattr(model.model, 'layer_router')}")
 
@@ -1011,7 +1029,7 @@ def train(attn_implementation=None):
         model.config.tune_dsu = training_args.tune_dsu = model_args.tune_dsu
 
         def _set_dsu_trainable(vision_tower, trainable: bool):
-            """设置 clip_encoder 中 DSU 相关模块的 requires_grad。"""
+            """Set requires_grad for DSU-related modules in clip_encoder."""
             if vision_tower is None:
                 return
             for m in (getattr(vision_tower, "text_global_proj", None),
@@ -1023,7 +1041,9 @@ def train(attn_implementation=None):
                         p.requires_grad = trainable
 
         if model_args.tune_mm_mlp_adapter:
-            # 开 LoRA 时不能整体 freeze，否则会把 LoRA 参数也冻住；只在不开 LoRA 时整体 freeze 再解冻 proj/DSU
+            # Do not freeze the whole model when LoRA is enabled, otherwise LoRA
+            # params are frozen too. Only fully freeze when LoRA is disabled, then
+            # re-enable projector/DSU modules.
             if not training_args.lora_enable:
                 model.requires_grad_(False)
             for p in model.get_model().mm_projector.parameters():
@@ -1033,7 +1053,8 @@ def train(attn_implementation=None):
             else:
                 _set_dsu_trainable(model.get_model().get_vision_tower(), False)
         elif model_args.tune_dsu:
-            # 只训练 DSU 模块：冻结全模型，仅解冻 text_global_proj / dsu / spatial_gate
+            # Train DSU modules only: freeze the full model, then unfreeze
+            # text_global_proj / dsu / spatial_gate.
             model.requires_grad_(False)
             _set_dsu_trainable(model.get_model().get_vision_tower(), True)
 
@@ -1050,6 +1071,7 @@ def train(attn_implementation=None):
         training_args.use_im_start_end = model_args.mm_use_im_start_end
         model.config.mm_use_im_patch_token = model_args.mm_use_im_patch_token
         model.config.align_loss_weight = model_args.align_loss_weight
+        model.config.dsu_reduction_ratio = model_args.dsu_reduction_ratio
         model.initialize_vision_tokenizer(model_args, tokenizer=tokenizer)
 
     if training_args.bits in [4, 8]:
@@ -1069,21 +1091,21 @@ def train(attn_implementation=None):
                                               data_args=data_args)
 
     # for name, param in model.named_parameters():
-    #     print(f"{name} 的梯度：", param.grad)
-    #     print(f"{name} 的需要修改：", param.requires_grad)
+    #     print(f"{name} grad:", param.grad)
+    #     print(f"{name} requires_grad:", param.requires_grad)
     # print("=" * 60)
-    # print("🔍 训练配置:")
+    # print("🔍 training config:")
     # print(f"  lora_enable: {training_args.lora_enable}")
     # print(f"  tune_mm_mlp_adapter: {model_args.tune_mm_mlp_adapter}")
     # print("=" * 60)
 
-    # # 检查模型结构
-    # print("\n🔍 layer_router 结构:")
+    # # inspect model structure
+    # print("\n🔍 layer_router structure:")
     # for name, module in model.get_model().layer_router.named_modules():
     #     if name:
     #         print(f"  {name}: {type(module).__name__}")
 
-    # print("\n🔍 ca 结构:")
+    # print("\n🔍 ca structure:")
     # for name, module in model.get_model().ca.named_modules():
     #     if name:
     #         print(f"  {name}: {type(module).__name__}")
@@ -1115,10 +1137,10 @@ def train(attn_implementation=None):
     else:
         trainer.train()
 
-    # print("\n🔍 深度检查 trainer.state:")
+    # print("\n🔍 deep check trainer.state:")
     # find_tensors_recursive(trainer.state, "trainer.state")
 
-    # print("\n🔍 深度检查 model.config:")
+    # print("\n🔍 deep check model.config:")
     # find_tensors_recursive(model.config, "model.config")
 
     trainer.save_state()

@@ -1,19 +1,21 @@
-#!/bin/bash
+
 set -e
 echo "[DEBUG] llavabench.sh start"
-ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
+ROOT="/code/LLaVA-scvm-answerloss"
 cd "$ROOT"
 echo "[DEBUG] ROOT=$ROOT"
 export PYTHONWARNINGS="ignore"
 # CUDA_VISIBLE_DEVICES=0
 
 # python -m llava.eval.model_vqa \
-#     --model-path /checkpoints/llava-v1.5-dynamic-multi-cl-finetune-loss/llava-v1.5-7b \
+#     --model-path /checkpoints/llava-v1.5-scvm-answerloss/llava-v1.5-7b \
 #     --question-file /dataset/eval/llava-bench-in-the-wild/questions.jsonl \
 #     --image-folder /dataset/eval/llava-bench-in-the-wild/images \
 #     --answers-file /dataset/eval/llava-bench-in-the-wild/answers/llava-v1.5-7b.jsonl \
 #     --temperature 0 \
 #     --conv-mode vicuna_v1
+
+export OPENAI_API_KEY="sk-t2pxTbIDe86FCMV_X4fW69h_4oWPLnyt0FE52mNIQUfsYere9yD0l3xsZgU"
 
 mkdir -p /dataset/eval/llava-bench-in-the-wild/reviews
 

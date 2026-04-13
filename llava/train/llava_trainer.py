@@ -166,7 +166,7 @@ class LLaVATrainer(Trainer):
                 dla_lr = self.args.mm_projector_lr
 
                 optimizer_grouped_parameters = [
-                    # -------- base (非 special) --------
+                    # -------- base (non-special) --------
                     {
                         "params": [p for n, p in opt_model.named_parameters()
                                 if (n in decay_parameters and n not in special_lr_parameters and p.requires_grad)],
@@ -178,7 +178,8 @@ class LLaVATrainer(Trainer):
                         "weight_decay": 0.0,
                     },
 
-                    # -------- mm_projector + vision_tower adapters（含 gate/alpha，同一 lr）--------
+                    # -------- mm_projector + vision_tower adapters
+                    #          (including gate/alpha, same LR) --------
                     {
                         "params": [p for n, p in opt_model.named_parameters()
                                 if (n in decay_parameters and n in special_lr_parameters and p.requires_grad)],
@@ -203,7 +204,7 @@ class LLaVATrainer(Trainer):
                         ],
                         "weight_decay": self.args.weight_decay,
                     },
-                    # -------- base no_decay（含 gate/alpha，与其它参数同一 lr）--------
+                    # -------- base no_decay (including gate/alpha, same LR as others) --------
                     {
                         "params": [
                             p for n, p in opt_model.named_parameters()
@@ -240,19 +241,24 @@ class LLaVATrainer(Trainer):
             run_dir = self._get_output_dir(trial=trial)
             output_dir = os.path.join(run_dir, checkpoint_folder)
 
-            keys_to_match = []
+            mm_keys_to_match = []
+            mema_keys_to_match = []
             if getattr(self.args, 'tune_mm_mlp_adapter', False):
-                keys_to_match.extend(['mm_projector', 'vision_resampler'])
+                mm_keys_to_match.extend(['mm_projector', 'vision_resampler'])
             if getattr(self.args, 'tune_dsu', False):
-                keys_to_match.extend(['text_global_proj', 'dsu', 'spatial_gate'])
+                mema_keys_to_match.extend(['text_global_proj', 'y_proj', 'dsu', 'spatial_gate'])
             if getattr(self.args, "use_im_start_end", False):
-                keys_to_match.extend(['embed_tokens', 'embed_in'])
+                mm_keys_to_match.extend(['embed_tokens', 'embed_in'])
 
-            weight_to_save = get_mm_adapter_state_maybe_zero_3(self.model.named_parameters(), keys_to_match)
+            mm_weight_to_save = get_mm_adapter_state_maybe_zero_3(self.model.named_parameters(), mm_keys_to_match) if mm_keys_to_match else {}
+            mema_weight_to_save = get_mm_adapter_state_maybe_zero_3(self.model.named_parameters(), mema_keys_to_match) if mema_keys_to_match else {}
 
             if self.args.local_rank == 0 or self.args.local_rank == -1:
                 self.model.config.save_pretrained(output_dir)
-                torch.save(weight_to_save, os.path.join(output_dir, f'mm_projector.bin'))
+                if mm_weight_to_save:
+                    torch.save(mm_weight_to_save, os.path.join(output_dir, 'mm_projector.bin'))
+                if mema_weight_to_save:
+                    torch.save(mema_weight_to_save, os.path.join(output_dir, 'Mema.bin'))
         else:
             super(LLaVATrainer, self)._save_checkpoint(model, trial, metrics)
 

@@ -24,7 +24,8 @@ from llava.constants import DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, D
 
 
 def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, load_4bit=False, device_map="auto", device="cuda", use_flash_attn=False, low_cpu_mem_usage=True, **kwargs):
-    # merge 时传 device_map=None, low_cpu_mem_usage=False；train/eval 用默认 device_map="auto", low_cpu_mem_usage=True
+    # Use device_map=None and low_cpu_mem_usage=False during merge;
+    # keep default device_map="auto" and low_cpu_mem_usage=True for train/eval.
     if device_map is not None:
         kwargs = {"device_map": device_map, **kwargs}
         if device != "cuda":
@@ -99,9 +100,29 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
             else:
                 tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
                 cfg_pretrained = AutoConfig.from_pretrained(model_path)
+                # Fix mm_hidden_size when config value does not match adapter weights.
+                # This can happen when tune_dsu saves only new vision_tower modules
+                # without mm_projector. Fall back to model_base config when needed.
+                _proj_bin = os.path.join(model_path, 'mm_projector.bin')
+                if not os.path.isfile(_proj_bin):
+                    _proj_bin = os.path.join(model_path, 'Mema.bin')
+                if os.path.isfile(_proj_bin):
+                    _w = torch.load(_proj_bin, map_location='cpu')
+                    _mm_key = next((k for k in _w if 'mm_projector' in k and _w[k].ndim == 2), None)
+                    if _mm_key is not None:
+                        cfg_pretrained.mm_hidden_size = _w[_mm_key].shape[1]
+                    elif hasattr(cfg_pretrained, 'mm_hidden_size'):
+                        # mm_projector is absent in this bin (DSU/gate-only);
+                        # inherit mm_hidden_size from model_base config.
+                        _base_cfg = AutoConfig.from_pretrained(model_base)
+                        if getattr(_base_cfg, 'mm_hidden_size', None):
+                            cfg_pretrained.mm_hidden_size = _base_cfg.mm_hidden_size
                 model = LlavaLlamaForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=low_cpu_mem_usage, config=cfg_pretrained, **kwargs)
 
-            mm_projector_weights = torch.load(os.path.join(model_path, 'mm_projector.bin'), map_location='cpu')
+            mm_projector_weights = {}
+            for _adapter_bin in (os.path.join(model_path, 'mm_projector.bin'), os.path.join(model_path, 'Mema.bin')):
+                if os.path.isfile(_adapter_bin):
+                    mm_projector_weights.update(torch.load(_adapter_bin, map_location='cpu'))
             mm_projector_weights = {k: v.to(torch.float16) for k, v in mm_projector_weights.items()}
             model.load_state_dict(mm_projector_weights, strict=False)
         else:

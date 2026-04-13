@@ -108,6 +108,9 @@ class DynamicSharingUnit(nn.Module):
         self.bi = nn.Parameter(torch.zeros(dim))
         self.bf = nn.Parameter(torch.zeros(dim))
         self._reset_parameters()
+        # print(f"DSU reduction ratio: {reduction_ratio}")
+        # print(f"DSU dimension: {dim}")
+        # print(f"DSU reduced dimension: {self.reduced_dim}")
 
     def _reset_parameters(self):
         nn.init.constant_(self.bf, 1.0)
@@ -140,6 +143,7 @@ class CLIPVisionTower(nn.Module):
         # self.select_layer = -1
         # print("-----------------------------------",self.select_layer)
         self.select_feature = getattr(args, 'mm_vision_select_feature', 'patch')
+        self.dsu_reduction_ratio = int(getattr(args, 'dsu_reduction_ratio', 4))
 
         if not delay_load:
             self.load_model()
@@ -152,7 +156,7 @@ class CLIPVisionTower(nn.Module):
             h = self.cfg_only.hidden_size
             num_layers = getattr(self.cfg_only, 'num_hidden_layers', 24)
             self.y_proj = nn.Linear(3 * h, h)
-            self.dsu = DynamicSharingUnit(dim=h, reduction_ratio=4)
+            self.dsu = DynamicSharingUnit(dim=h, reduction_ratio=self.dsu_reduction_ratio)
             self.spatial_gate = SpatialGate(h)
 
     def load_model(self, device_map=None):
@@ -179,7 +183,7 @@ class CLIPVisionTower(nn.Module):
         else:
             self.text_global_proj = nn.Linear(self.llm_hidden_size, h).to(device=dev, dtype=dtype)
             self.y_proj = nn.Linear(3 * h, h).to(device=dev, dtype=dtype)
-            self.dsu = DynamicSharingUnit(dim=h, reduction_ratio=4).to(device=dev, dtype=dtype)
+            self.dsu = DynamicSharingUnit(dim=h, reduction_ratio=self.dsu_reduction_ratio).to(device=dev, dtype=dtype)
             self.spatial_gate = SpatialGate(h).to(device=dev, dtype=dtype)
         self.is_loaded = True
 

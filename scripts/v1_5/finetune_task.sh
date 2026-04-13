@@ -1,35 +1,29 @@
 #!/bin/bash
-# 多组实验：仅更换 align_loss_weight 和 learning_rate，每组训练 + merge（可选测评）
-set -e
+# Multi-run experiment script: vary align_loss_weight, learning_rate, and
+# dsu_reduction_ratio; each run performs training + merge (optional evaluation).
 cd /code/LLaVA-scvm-answerloss
 export PYTHONWARNINGS="ignore"
 export PYTHONPATH=/code/LLaVA-scvm-answerloss
 
-# 实验列表：每行 "align_loss_weight learning_rate"
-# 可随意增删改行
+# Experiment list: each row is
+# "align_loss_weight learning_rate dsu_reduction_ratio"
+# (third field defaults to 4 if omitted).
+# Feel free to add/remove/edit rows.
 EXPERIMENTS=(
-    "0.15  5e-5"
-    "0.15  2e-5"
-    "0.1  5e-5"
-    "0.1  2e-5"
-    "0.2  5e-5"
-    "0.3  2e-5"
-    "0.1  1e-5"
-    "0.15  5e-6"
-    "0.1  2e-6"
-    "0.05  5e-5"
-    "0.05  2e-5"
+    "0.1  1e-4  4"
 )
 
 for exp in "${EXPERIMENTS[@]}"; do
-    read -r ALIGN_LOSS_WEIGHT LEARNING_RATE <<< "$exp"
-    # 用权重和学率生成唯一目录名
-    SPLIT="llava-v1.5-7b-align${ALIGN_LOSS_WEIGHT}-lr${LEARNING_RATE}"
+    read -r ALIGN_LOSS_WEIGHT LEARNING_RATE DSU_REDUCTION_RATIO <<< "$exp"
+    DSU_REDUCTION_RATIO="${DSU_REDUCTION_RATIO:-4}"
+    # Build a unique run directory name from weight/lr/reduction settings.
+    SPLIT="llava-v1.5-7b-align${ALIGN_LOSS_WEIGHT}-lr${LEARNING_RATE}-rr${DSU_REDUCTION_RATIO}-check"
     echo "=============================================="
-    echo "Running: align_loss_weight=$ALIGN_LOSS_WEIGHT, learning_rate=$LEARNING_RATE -> $SPLIT"
+    echo "Running: align_loss_weight=$ALIGN_LOSS_WEIGHT, learning_rate=$LEARNING_RATE, dsu_reduction_ratio=$DSU_REDUCTION_RATIO -> $SPLIT"
     echo "=============================================="
 
-    # 每次训练前恢复可见全部 GPU，避免上一轮 eval 的 CUDA_VISIBLE_DEVICES=0 导致 deepspeed 只看到 1 张卡
+    # Restore all visible GPUs before each run. This avoids inheriting
+    # CUDA_VISIBLE_DEVICES=0 from previous eval and exposing only one GPU.
     unset CUDA_VISIBLE_DEVICES
     deepspeed --master_port 29400 --include localhost:0,1 llava/train/train_mem.py \
         --deepspeed ./scripts/zero2.json \
@@ -37,6 +31,7 @@ for exp in "${EXPERIMENTS[@]}"; do
         --version v1 \
         --tune_dsu True \
         --align_loss_weight "$ALIGN_LOSS_WEIGHT" \
+        --dsu_reduction_ratio "$DSU_REDUCTION_RATIO" \
         --data_path /dataset/LLaVA-Tuning/llava_v1_5_mix20k.json \
         --image_folder /dataset/LLaVA-Tuning \
         --vision_tower /models/clip-vit-large-patch14-336 \
@@ -73,7 +68,8 @@ for exp in "${EXPERIMENTS[@]}"; do
         --model-base /models/llava-v1.5-7b \
         --save-model-path /checkpoints/$SPLIT/llava-v1.5-7b
 
-    # 可选：每组训完后跑 MME 测评（按需取消注释并改 answers 名）
+    # Optional: run MME evaluation after each run
+    # (edit answers filename as needed).
     export CUDA_VISIBLE_DEVICES=0
     python -m llava.eval.model_vqa_loader \
         --model-path /checkpoints/$SPLIT/llava-v1.5-7b \

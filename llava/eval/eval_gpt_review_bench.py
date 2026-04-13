@@ -7,12 +7,13 @@ import time
 
 NUM_SECONDS_TO_SLEEP = 0.5
 
+openai.api_base = "https://api.uniapi.io/v1"
 
 def get_eval(content: str, max_tokens: int):
     while True:
         try:
             response = openai.ChatCompletion.create(
-                model='gpt-4-0314',
+                model='gpt-5.4',
                 messages=[{
                     'role': 'system',
                     'content': 'You are a helpful and precise assistant for checking the quality of the answer.'

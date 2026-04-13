@@ -99,7 +99,8 @@ class LlavaMetaModel:
 
             self.mm_projector.load_state_dict(get_w(mm_projector_weights, 'mm_projector'))
 
-            # 若 checkpoint 中含 vision_tower 内可训练参数（text_global_proj/dsu/spatial_gate），一并加载
+            # If the checkpoint includes trainable vision_tower params
+            # (text_global_proj/dsu/spatial_gate), load them together.
             vision_tower = self.get_vision_tower()
             if vision_tower is not None:
                 vt_weights = get_w(mm_projector_weights, 'vision_tower')
@@ -154,8 +155,13 @@ class LlavaMetaForCausalLM(ABC):
         return self.get_model().get_layer_router()
 
     def encode_images(self, images, text_global=None, image_split_sizes=None, answer_global=None, answer_valid_mask=None):
-        """编码图像；返回 (image_features, c_agg)。c_agg 为 c_24 经 mm_proj 后按 batch 聚合，供与 LLM last hidden 对齐。"""
-        # vision tower：CLIPVisionTower 返回 (image_features, image_forward_outs, c_24)；S2 等可能只返回 image_features
+        """Encode images and return (image_features, c_agg).
+        c_agg is c_24 projected by mm_projector and aggregated per batch item for
+        alignment with the LLM last hidden representation.
+        """
+        # Vision tower behavior: CLIPVisionTower returns
+        # (image_features, image_forward_outs, c_24); some variants (e.g., S2)
+        # may return image_features only.
         _ret = self.get_model().get_vision_tower()(
             images, text_global=text_global, image_split_sizes=image_split_sizes,
             answer_global=answer_global, answer_valid_mask=answer_valid_mask
@@ -168,7 +174,9 @@ class LlavaMetaForCausalLM(ABC):
         image_features = self.get_model().mm_projector(image_features)
         c_agg = None
         if c_24 is not None:
-            # c_24 [N, D_clip] -> mm_proj -> [N, D_llm]，再按 image_split_sizes 聚合成 [B, D_llm]；与 image_features 同 dtype/device 避免 mat1/mat2 dtype 不一致
+            # c_24 [N, D_clip] -> mm_proj -> [N, D_llm], then aggregate by
+            # image_split_sizes into [B, D_llm]. Keep dtype/device consistent
+            # with image_features to avoid mat1/mat2 dtype mismatch.
             c_24_proj = self.get_model().mm_projector(
                 c_24.unsqueeze(1).to(dtype=image_features.dtype, device=image_features.device)
             ).squeeze(1)
@@ -180,7 +188,10 @@ class LlavaMetaForCausalLM(ABC):
         return image_features, c_agg
 
     def _encode_images_for_multimodal(self, images, image_sizes=None, text_global=None, answer_global=None, answer_valid_mask=None):
-        """对图片进行编码，支持 list/5维 与单张图片两种输入。返回 (image_features, c_agg)。"""
+        """Encode images for multimodal input.
+        Supports list/5D input and single-image input, returns
+        (image_features, c_agg).
+        """
         if type(images) is list or images.ndim == 5:
             if type(images) is list:
                 images = [x.unsqueeze(0) if x.ndim == 3 else x for x in images]
@@ -234,8 +245,10 @@ class LlavaMetaForCausalLM(ABC):
             else:
                 raise ValueError(f"Unexpected mm_patch_merge_type: {self.config.mm_patch_merge_type}")
         else:
-            image_split_sizes = [images.shape[0]] if images.ndim == 4 else None
+            image_split_sizes = [1] * images.shape[0] if images.ndim == 4 else None
             image_features, c_agg = self.encode_images(images, text_global=text_global, image_split_sizes=image_split_sizes, answer_global=answer_global, answer_valid_mask=answer_valid_mask)
+            print("image_features shape", image_features.shape)
+            print("c_agg shape", c_agg.shape)
         return image_features, c_agg
     def prepare_inputs_labels_for_multimodal(
         self, input_ids, position_ids, attention_mask, past_key_values, labels,
@@ -277,7 +290,7 @@ class LlavaMetaForCausalLM(ABC):
 
         batch_size = len(input_ids)
 
-        # ----- 第一遍：收集所有样本的 flat_text_ids、question_ids、split_sizes 等 -----
+        # ----- Pass 1: collect flat_text_ids, question_ids, split_sizes, etc. -----
         flat_text_ids_list = []
         question_ids_list = []
         answer_ids_list = []
@@ -292,15 +305,18 @@ class LlavaMetaForCausalLM(ABC):
             cur_labels = labels[batch_idx]
             labels_per_sample.append(cur_labels)
 
-            # 与 train.py 一致：labels==IGNORE_INDEX 为 question/instruction，!=IGNORE_INDEX 为 answer；
-            # PLAIN 为对齐阶段，通常只有 answer（无独立 question），令 question = answer 合理。
+            # Keep behavior aligned with train.py:
+            # labels==IGNORE_INDEX are question/instruction tokens,
+            # labels!=IGNORE_INDEX are answer tokens.
+            # In PLAIN mode (alignment stage), there is usually no standalone
+            # question, so using question = answer is reasonable.
             if num_images == 0:
                 flat_text_labels = cur_labels
                 flat_text_ids = cur_input_ids
                 answer_mask = (flat_text_labels != IGNORE_INDEX)
                 answer_ids = flat_text_ids[answer_mask] if answer_mask.any() else flat_text_ids[:1]
                 if conversation_lib.default_conversation.sep_style == conversation_lib.SeparatorStyle.PLAIN:
-                    question_ids = answer_ids  # 对齐阶段无独立 question
+                    question_ids = answer_ids  # No standalone question in alignment stage.
                 else:
                     question_mask_on_flat = (flat_text_labels == IGNORE_INDEX)
                     question_ids = flat_text_ids[question_mask_on_flat] if question_mask_on_flat.any() else flat_text_ids[:1]
@@ -321,7 +337,7 @@ class LlavaMetaForCausalLM(ABC):
                 answer_mask = (flat_text_labels != IGNORE_INDEX)
                 answer_ids = flat_text_ids[answer_mask] if answer_mask.any() else flat_text_ids[:1]
                 if conversation_lib.default_conversation.sep_style == conversation_lib.SeparatorStyle.PLAIN:
-                    question_ids = answer_ids  # 对齐阶段无独立 question
+                    question_ids = answer_ids  # No standalone question in alignment stage.
                 else:
                     question_mask = (flat_text_labels == IGNORE_INDEX)
                     question_ids = flat_text_ids[question_mask] if question_mask.any() else flat_text_ids[:1]
@@ -330,7 +346,8 @@ class LlavaMetaForCausalLM(ABC):
             question_ids_list.append(question_ids)
             answer_ids_list.append(answer_ids)
 
-        # ----- 按 batch 一起做 text embed，再在 length 维求 mean 得到 text_global（不 padding） -----
+        # ----- Embed text for the whole batch, then mean on length dimension
+        #       to get text_global (without padding). -----
         flat_lengths = [t.shape[0] for t in flat_text_ids_list]
         all_flat_ids = torch.cat(flat_text_ids_list, dim=0)
         all_flat_embeds = self.get_model().embed_tokens(all_flat_ids)
@@ -341,9 +358,11 @@ class LlavaMetaForCausalLM(ABC):
         all_question_embeds = self.get_model().embed_tokens(all_question_ids)
         question_embeds_list = list(torch.split(all_question_embeds, question_lengths, dim=0))
         question_global_text_list = [e.mean(dim=0) for e in question_embeds_list]
-        # text_global 需为 [B, D]；question_embeds_list 各样本长度不同无法 stack，用每样本 flat text 的 mean
+        # text_global must be [B, D]. question_embeds_list has variable lengths
+        # across samples, so use per-sample mean over flat text embeddings.
         text_global = torch.stack(question_global_text_list, dim=0)  # [batch_size, D]
-        # answer_global: 对 answer token embeddings 取 mean，供 encoder 内 L_align 使用
+        # answer_global: mean over answer token embeddings, used by
+        # alignment loss inside the encoder.
         answer_lengths = [t.shape[0] for t in answer_ids_list]
         all_answer_ids = torch.cat(answer_ids_list, dim=0)
         all_answer_embeds = self.get_model().embed_tokens(all_answer_ids)
@@ -352,10 +371,12 @@ class LlavaMetaForCausalLM(ABC):
         answer_global = torch.stack(answer_global_text_list, dim=0)  # [batch_size, D]
         answer_valid_mask = torch.tensor([(labels_per_sample[i] != IGNORE_INDEX).any().item() for i in range(batch_size)], device=text_global.device, dtype=torch.bool)
 
-        # ----- 在得到 text_global / answer_global 后再做 image encode，并传入供 encode 内部使用 -----
+        # ----- After text_global / answer_global are ready, encode images and
+        #       pass them into encode_images internals. -----
         image_features, c_agg = self._encode_images_for_multimodal(images, image_sizes, text_global=text_global, answer_global=answer_global, answer_valid_mask=answer_valid_mask)
 
-        # ----- 第二遍：用预计算的 flat_text_embeds / question_embeds，保持与 image 拼接流程不变 -----
+        # ----- Pass 2: use precomputed flat_text_embeds/question_embeds while
+        #       keeping the image concatenation flow unchanged. -----
         new_input_embeds = []
         new_labels = []
         cur_image_idx = 0
