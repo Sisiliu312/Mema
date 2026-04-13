@@ -69,9 +69,6 @@ class DynamicSharingUnit(nn.Module):
         self.bi = nn.Parameter(torch.zeros(dim))
         self.bf = nn.Parameter(torch.zeros(dim))
         self._reset_parameters()
-        # print(f"DSU reduction ratio: {reduction_ratio}")
-        # print(f"DSU original dimension: {dim}")
-        # print(f"DSU reduced dimension: {self.reduced_dim}")
 
     def _reset_parameters(self):
         nn.init.constant_(self.bf, 1.0)

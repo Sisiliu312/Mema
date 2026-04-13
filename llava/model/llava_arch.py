@@ -250,6 +250,7 @@ class LlavaMetaForCausalLM(ABC):
             print("image_features shape", image_features.shape)
             print("c_agg shape", c_agg.shape)
         return image_features, c_agg
+        
     def prepare_inputs_labels_for_multimodal(
         self, input_ids, position_ids, attention_mask, past_key_values, labels,
         images, image_sizes=None,
