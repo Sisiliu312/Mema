@@ -20,12 +20,12 @@ class SpatialGate(nn.Module):
             nn.GELU(),
             nn.Linear(feature_dim, feature_dim),
         )
-        # token-wise alpha：由 h 预测每个 token 的 alpha
+        # Token-wise alpha: predict a gate weight for each token from h
         self.alpha_proj = nn.Linear(feature_dim, 1)
         self._reset_parameters()
 
     def _reset_parameters(self):
-        """近恒等初始化：delta≈0，token_alpha 初始较小，使 gate 初始时几乎不改变 x。"""
+        """Near-identity initialization: delta≈0 and token_alpha starts small so the gate barely changes x at initialization."""
         nn.init.constant_(self.delta[0].weight, 0.0)
         nn.init.constant_(self.delta[0].bias, 0.0)
         nn.init.constant_(self.delta[2].weight, 0.0)
@@ -42,60 +42,21 @@ class SpatialGate(nn.Module):
 
         h = F.layer_norm(x + c, (x.size(-1),))
 
-        # 1) 看 tanh 之前的 delta 幅度（是否过大导致 tanh 饱和）
+        # 1) Inspect delta magnitude before tanh (too large may cause tanh saturation)
         delta_pre = self.delta(h)                      # [N, D]
         delta = torch.tanh(delta_pre)                 # [N, D]
 
-        # token-wise alpha
+        # Token-wise alpha
         token_alpha = torch.sigmoid(self.alpha_proj(h))  # [N, 1]
 
         update = token_alpha * delta
         x_ref = x + update
 
-        # eps = 1e-8
-        # x_norm = x.norm(dim=-1) + eps                 # [N]
-        # upd_norm = update.norm(dim=-1)                # [N]
-        # ratio = (upd_norm / x_norm).mean()
-
-        # # 2) 方向指标：cos(x, update) 以及 cos(x, x_ref)
-        # cos_x_upd = F.cosine_similarity(x, update, dim=-1).mean()
-        # cos_x_xref = F.cosine_similarity(x, x_ref, dim=-1).mean()
-
-        # # 3) token 级别：更新是不是集中在少数 token？
-        # #    这里 x 是 [N,D]（你外面把 N=token 扁平了），所以直接按 N 排序即可
-        # r = (upd_norm / x_norm).detach()              # [N]
-        # r_sorted, _ = torch.sort(r)
-        # top1 = r_sorted[int(0.99 * (r_sorted.numel()-1))]
-        # top10 = r_sorted[int(0.90 * (r_sorted.numel()-1))]
-        # med = r_sorted[int(0.50 * (r_sorted.numel()-1))]
-
-        # # 4) 饱和比例：delta 有多少维接近 ±1（tanh 饱和）
-        # sat = (delta.abs() > 0.98).float().mean()
-        # # 也可以看 pre-tanh 的幅度分布
-        # pre_abs_mean = delta_pre.abs().mean()
-        # pre_abs_max = delta_pre.abs().max()
-
-        # # ---- print (token-wise alpha: [N,1]，打印 min/max/mean) ----
-        # tag = f"{prefix}[Gate"
-        # if layer_idx is not None:
-        #     tag += f" L{layer_idx}"
-        # tag += "]"
-        # ta = token_alpha.squeeze(-1)  # [N]
-        # print(
-        #     f"{tag} "
-        #     f"token_alpha min={ta.min().item():.4f} max={ta.max().item():.4f} mean={ta.mean().item():.4f} | "
-        #     f"ratio={ratio.item():.4f} | "
-        #     f"cos(x,upd)={cos_x_upd.item():.4f} cos(x,x_ref)={cos_x_xref.item():.4f} | "
-        #     f"r_med={med.item():.4f} r_top10%={top10.item():.4f} r_top1%={top1.item():.4f} | "
-        #     f"sat(|tanh|>0.98)={sat.item():.3f} | "
-        #     f"|pre|mean={pre_abs_mean.item():.3f} |pre|max={pre_abs_max.item():.3f}"
-        # )
-
         return x_ref
 
 
 class DynamicSharingUnit(nn.Module):
-    """单 memory [N, D]，与 dynamic-image-mean-max 一致。"""
+    """Single memory [N, D], consistent with dynamic-image-mean-max."""
     def __init__(self, dim, reduction_ratio=4):
         super().__init__()
         self.dim = dim
@@ -109,7 +70,7 @@ class DynamicSharingUnit(nn.Module):
         self.bf = nn.Parameter(torch.zeros(dim))
         self._reset_parameters()
         # print(f"DSU reduction ratio: {reduction_ratio}")
-        # print(f"DSU dimension: {dim}")
+        # print(f"DSU original dimension: {dim}")
         # print(f"DSU reduced dimension: {self.reduced_dim}")
 
     def _reset_parameters(self):
@@ -118,7 +79,7 @@ class DynamicSharingUnit(nn.Module):
         nn.init.constant_(self.bc, 0.0)
 
     def forward(self, y_l, text_global, c_prev):
-        """y_l/text_global: [N, D]；c_prev: [N, D]。返回 c_l [N, D]。"""
+        """y_l/text_global: [N, D]; c_prev: [N, D]. Returns c_l [N, D]."""
         c_prev_norm = F.layer_norm(c_prev, (c_prev.shape[-1],))
         combined = torch.cat([c_prev_norm, y_l, text_global], dim=-1)
         s = F.relu(self.W1(combined))
@@ -134,9 +95,9 @@ class CLIPVisionTower(nn.Module):
         super().__init__()
 
         self.is_loaded = False
-        # LLM hidden_size (e.g. 4096)，用于将 text_global 投影到 CLIP hidden (1024)
+        # LLM hidden size (e.g., 4096), used to project text_global to CLIP hidden size (e.g., 1024)
         self.llm_hidden_size = getattr(args, 'hidden_size', 4096)
-        self.text_global_proj = None  # 在 load_model 中创建：Linear(4096, 1024)
+        self.text_global_proj = None  # Created in load_model: Linear(4096, 1024)
 
         self.vision_tower_name = vision_tower
         self.select_layer = args.mm_vision_select_layer
@@ -151,7 +112,7 @@ class CLIPVisionTower(nn.Module):
             self.load_model()
         else:
             self.cfg_only = CLIPVisionConfig.from_pretrained(self.vision_tower_name)
-            # delay_load 时也创建 text_global 投影，以便后续 forward 可用
+            # Also create text_global projection in delay_load mode so later forward calls can use it
             self.text_global_proj = nn.Linear(self.llm_hidden_size, self.cfg_only.hidden_size)
             h = self.cfg_only.hidden_size
             num_layers = getattr(self.cfg_only, 'num_hidden_layers', 24)
@@ -172,7 +133,8 @@ class CLIPVisionTower(nn.Module):
         dtype = self.vision_tower.dtype
         h = self.vision_tower.config.hidden_size
 
-        # 若 delay_load 时已创建且已从 checkpoint 加载，不要用新初始化覆盖（避免覆盖 dsu/spatial_gate/text_global_proj/y_proj）
+        # If modules were already created during delay_load and restored from checkpoint,
+        # do not overwrite them with fresh initialization
         if getattr(self, 'dsu', None) is not None:
             if self.text_global_proj is not None:
                 self.text_global_proj = self.text_global_proj.to(device=dev, dtype=dtype)
@@ -198,8 +160,10 @@ class CLIPVisionTower(nn.Module):
         return image_features
 
     def _forward_vision_with_dsu(self, pixel_values, text_global_proj, image_split_sizes=None, output_attentions=True):
-        """逐层跑 CLIP encoder，每层后用 DSU 积累 c_l，用 SpatialGate 以 c_l 做 refresh，再输入下一层。
-        text_global_proj [B, D] 每个样本一个；image_split_sizes 为每样本图像数，用于把 text 对齐到 N 张图。
+        """Run CLIP encoder layer by layer: after each layer, accumulate c_l with DSU,
+        refresh hidden states with SpatialGate conditioned on c_l, then feed into next layer.
+        text_global_proj [B, D] has one vector per sample; image_split_sizes is image count per sample,
+        used to align text features to N images.
         """
         vm = self.vision_tower.vision_model
         dev = pixel_values.device
@@ -210,7 +174,7 @@ class CLIPVisionTower(nn.Module):
         hidden_states = vm.pre_layrnorm(hidden_states)
         N, L, D = hidden_states.shape
 
-        # 每个样本有自己的 text_global [B, D]；按 image 数展开为 [N, D]，与 N 张图一一对应
+        # Each sample has its own text_global [B, D]; expand by image count to [N, D] to match N images
         if image_split_sizes is not None and len(image_split_sizes) == text_global_proj.shape[0]:
             text_global_expanded = torch.repeat_interleave(
                 text_global_proj.to(device=dev, dtype=dtype),
@@ -219,9 +183,9 @@ class CLIPVisionTower(nn.Module):
             )
         else:
             text_global_expanded = text_global_proj.to(device=dev, dtype=dtype)
-        assert text_global_expanded.shape[0] == N, "text_global 展开后应与图像数 N 一致"
+        assert text_global_expanded.shape[0] == N, "Expanded text_global must match image count N"
 
-        # 单 memory [N, D]，与 dynamic-image-mean-max 一致
+        # Single memory vector [N, D], consistent with dynamic-image-mean-max
         c_prev = torch.zeros(N, D, device=dev, dtype=dtype)
 
         encoder_states = (hidden_states,)
@@ -238,7 +202,7 @@ class CLIPVisionTower(nn.Module):
             if output_attentions:
                 all_attentions = all_attentions + (layer_outputs[1],)
 
-            # 多视角摘要 mean+max+cls 压回 D
+            # Multi-view summary (mean + max + cls), then project back to D
             mean = hidden_states.mean(dim=1)
             maxv = hidden_states.amax(dim=1)
             cls_tok = hidden_states[:, 0, :]
@@ -265,7 +229,7 @@ class CLIPVisionTower(nn.Module):
         return image_forward_outs, c_prev
 
     def forward(self, images, text_global=None, image_split_sizes=None, answer_global=None, answer_valid_mask=None):
-        """返回 (image_features, c_sem)。c_sem 即单 memory c_24，供 mm_proj 后与 LLM last hidden 对齐。"""
+        """Returns (image_features, c_sem). c_sem is single-memory c_24, used after mm_proj to align with LLM last hidden states."""
         output_dir = "attention_maps/attention_layer_image1"
         os.makedirs(output_dir, exist_ok=True)
 
@@ -293,7 +257,7 @@ class CLIPVisionTower(nn.Module):
                     image_split_sizes=image_split_sizes,
                     output_attentions=True,
                 )
-                c_sem = c  # 单 memory c_24，供 mm_proj 后与 LLM hidden 对齐
+                c_sem = c  # Single-memory c_24 for alignment with LLM hidden states after mm_proj
             else:
                 with torch.no_grad():
                     image_forward_outs = self.vision_tower(
@@ -380,7 +344,7 @@ class CLIPVisionTowerS2(CLIPVisionTower):
         image_forward_outs = self.vision_tower(
             images.to(device=self.device, dtype=self.dtype),
             output_hidden_states=True,
-            output_attentions=True  # 启用 Attention Map 输出
+            output_attentions=True  # Enable attention map output
         )
         
         image_features = self.feature_select(image_forward_outs).to(images.dtype)

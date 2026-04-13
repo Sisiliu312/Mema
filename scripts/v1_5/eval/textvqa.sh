@@ -1,10 +1,8 @@
 #!/bin/bash
-cd /code/LLaVA-scvm-answerloss
 export PYTHONWARNINGS="ignore"
-# CUDA_VISIBLE_DEVICES=0
 
 python -m llava.eval.model_vqa_loader \
-    --model-path /checkpoints/llava-v1.5-7b-align0.1-lr1e-4/llava-v1.5-7b \
+    --model-path /path/to/your_checkpoint_dir \
     --question-file /dataset/eval/textvqa/llava_textvqa_val_v051_ocr.jsonl \
     --image-folder /dataset/eval/textvqa/train_images \
     --answers-file /dataset/eval/textvqa/answers/llava-v1.5-7b.jsonl \

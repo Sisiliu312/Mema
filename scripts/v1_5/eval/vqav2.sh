@@ -1,6 +1,3 @@
-cd /code/LLaVA-scvm-answerloss
-export PYTHONWARNINGS="ignore"
-# CUDA_VISIBLE_DEVICES=0
 
 gpu_list="${CUDA_VISIBLE_DEVICES:-0}"
 IFS=',' read -ra GPULIST <<< "$gpu_list"
@@ -12,7 +9,7 @@ SPLIT="llava_vqav2_mscoco_test-dev2015"
 
 for IDX in $(seq 0 $((CHUNKS-1))); do
     CUDA_VISIBLE_DEVICES=${GPULIST[$IDX]} python -m llava.eval.model_vqa_loader \
-        --model-path /checkpoints/llava-v1.5-13b-align0.15-lr5e-5/$CKPT \
+        --model-path /path/to/your_checkpoint_dir \
         --question-file  /dataset/eval/vqav2/$SPLIT.jsonl \
         --image-folder  /dataset/eval/vqav2/test2015 \
         --answers-file  /dataset/eval/vqav2/answers/$SPLIT/$CKPT/${CHUNKS}_${IDX}.jsonl \

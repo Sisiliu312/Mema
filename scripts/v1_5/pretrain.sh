@@ -1,13 +1,11 @@
 #!/bin/bash
-cd /home/data/shika/LLaVA-ly
-export PYTHONWARNINGS="ignore"
 
-/home/data/shika/miniconda3/envs/llava/bin/deepspeed --master_port 29400 --include localhost:0,1,2,3 llava/train/train_mem.py \
+deepspeed llava/train/train_mem.py \
     --deepspeed ./scripts/zero2.json \
-    --model_name_or_path lmsys/vicuna-7b-v1.5 \
+    --model_name_or_path lmsys/vicuna-13b-v1.5 \
     --version plain \
-    --data_path /home/data/shika/LLaVA/playground/data/LLaVA-Pretrain/blip_laion_cc_sbu_58k.json \
-    --image_folder /home/data/shika/LLaVA/playground/data/LLaVA-Pretrain/images \
+    --data_path ./playground/data/LLaVA-Pretrain/blip_laion_cc_sbu_558k.json \
+    --image_folder ./playground/data/LLaVA-Pretrain/images \
     --vision_tower openai/clip-vit-large-patch14-336 \
     --mm_projector_type mlp2x_gelu \
     --tune_mm_mlp_adapter True \
@@ -15,7 +13,7 @@ export PYTHONWARNINGS="ignore"
     --mm_use_im_start_end False \
     --mm_use_im_patch_token False \
     --bf16 True \
-    --output_dir ./checkpoints/llava-v1.5-7b-pretrain \
+    --output_dir ./checkpoints/llava-v1.5-13b-pretrain \
     --num_train_epochs 1 \
     --per_device_train_batch_size 32 \
     --per_device_eval_batch_size 4 \
@@ -36,8 +34,42 @@ export PYTHONWARNINGS="ignore"
     --lazy_preprocess True \
     --report_to wandb
 
-CUDA_VISIBLE_DEVICES=6,7
-python ./scripts/merge_lora_weights.py \
-    --model-path ./checkpoints/llava-v1.5-7b-lora \
-    --model-base ./checkpoints/llava-v1.5-7b-pretrain \
-    --save-model-path ./checkpoints/llava-v1.5-7b
+
+
+#!/bin/bash
+
+deepspeed llava/train/train_mem.py \
+    --deepspeed ./scripts/zero3.json \
+    --model_name_or_path lmsys/vicuna-13b-v1.5 \
+    --version v1 \
+    --data_path ./playground/data/llava_v1_5_mix665k.json \
+    --image_folder ./playground/data \
+    --vision_tower openai/clip-vit-large-patch14-336 \
+    --pretrain_mm_mlp_adapter ./checkpoints/llava-v1.5-13b-pretrain/mm_projector.bin \
+    --mm_projector_type mlp2x_gelu \
+    --mm_vision_select_layer -2 \
+    --mm_use_im_start_end False \
+    --mm_use_im_patch_token False \
+    --image_aspect_ratio pad \
+    --group_by_modality_length True \
+    --bf16 True \
+    --output_dir ./checkpoints/llava-v1.5-13b \
+    --num_train_epochs 1 \
+    --per_device_train_batch_size 16 \
+    --per_device_eval_batch_size 4 \
+    --gradient_accumulation_steps 1 \
+    --evaluation_strategy "no" \
+    --save_strategy "steps" \
+    --save_steps 50000 \
+    --save_total_limit 1 \
+    --learning_rate 2e-5 \
+    --weight_decay 0. \
+    --warmup_ratio 0.03 \
+    --lr_scheduler_type "cosine" \
+    --logging_steps 1 \
+    --tf32 True \
+    --model_max_length 2048 \
+    --gradient_checkpointing True \
+    --dataloader_num_workers 4 \
+    --lazy_preprocess True \
+    --report_to wandb

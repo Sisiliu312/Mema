@@ -1,12 +1,10 @@
 #!/bin/bash
-cd /code/LLaVA-scvm-answerloss
 export PYTHONWARNINGS="ignore"
-# CUDA_VISIBLE_DEVICES=0
 
 SPLIT="mmbench_dev_20230712"
 
 python -m llava.eval.model_vqa_mmbench \
-    --model-path /checkpoints/llava-v1.5-13b-align0.15-lr5e-5/llava-v1.5-13b \
+    --model-path /path/to/your_checkpoint_dir \
     --question-file /dataset/eval/mmbench/$SPLIT.tsv \
     --answers-file /dataset/eval/mmbench/answers/$SPLIT/llava-v1.5-7b.jsonl \
     --single-pred-prompt \

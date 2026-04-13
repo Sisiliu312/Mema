@@ -810,33 +810,6 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
                 data_collator=data_collator)
 
 
-# def register_gradient_hooks(model):
-#     """Set different gradient scaling factors for different modules."""
-#     for name, param in model.named_parameters():
-#         if not param.requires_grad:
-#             continue
-#         if 'text_dla' in name:
-#             def make_hook(pname):
-#                 def hook_fn(grad):
-#                     if grad is not None:
-#                         print(f"[DLA] {pname}: {grad.norm():.6e}")
-#                     return grad
-#                 return hook_fn
-#             param.register_hook(make_hook(name))
-
-def register_gradient_hooks(model):
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        def make_hook(pname):
-            def hook_fn(grad):
-                if grad is not None:
-                    print(f"[Grad] {pname}: {grad.norm().item():.6e}")
-                return grad
-            return hook_fn
-
-        param.register_hook(make_hook(name))
-
 def find_tensors_recursive(obj, path="root"):
     """Recursively find all Tensor objects."""
     if isinstance(obj, torch.Tensor):
@@ -917,21 +890,6 @@ def train(attn_implementation=None):
                 torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
                 **bnb_model_from_pretrained_args
             )
-            # print(model)
-            # print("-=-=-=-=-=-from_pretrained-=-=-=-=-=-=-=-")
-            # print(f"🔍 after from_pretrained:")
-            # print(f"  hasattr(model.model, 'ca'): {hasattr(model.model, 'ca')}")
-            # print(f"  hasattr(model.model, 'layer_router'): {hasattr(model.model, 'layer_router')}")
-
-            # if hasattr(model.model, 'ca'):
-            #     print(f"  model.model.ca: {model.model.ca}")
-            #     if hasattr(model.model.ca, 'W_q'):
-            #         print(f"  model.model.ca.W_q.weight.shape: {model.model.ca.W_q.weight.shape}")
-
-            # if hasattr(model.model, 'layer_router'):
-            #     print(f"  model.model.layer_router: {model.model.layer_router}")
-            #     if hasattr(model.model.layer_router, 'w1'):
-            #         print(f"  model.model.layer_router.w1.weight.shape: {model.model.layer_router.w1.weight.shape}")
     else:
         model = transformers.LlamaForCausalLM.from_pretrained(
             model_args.model_name_or_path,
@@ -1090,58 +1048,16 @@ def train(attn_implementation=None):
     data_module = make_supervised_data_module(tokenizer=tokenizer,
                                               data_args=data_args)
 
-    # for name, param in model.named_parameters():
-    #     print(f"{name} grad:", param.grad)
-    #     print(f"{name} requires_grad:", param.requires_grad)
-    # print("=" * 60)
-    # print("🔍 training config:")
-    # print(f"  lora_enable: {training_args.lora_enable}")
-    # print(f"  tune_mm_mlp_adapter: {model_args.tune_mm_mlp_adapter}")
-    # print("=" * 60)
-
-    # # inspect model structure
-    # print("\n🔍 layer_router structure:")
-    # for name, module in model.get_model().layer_router.named_modules():
-    #     if name:
-    #         print(f"  {name}: {type(module).__name__}")
-
-    # print("\n🔍 ca structure:")
-    # for name, module in model.get_model().ca.named_modules():
-    #     if name:
-    #         print(f"  {name}: {type(module).__name__}")
-
     trainer = LLaVATrainer(model=model,
                     tokenizer=tokenizer,
                     args=training_args,
                     **data_module)
-
-    # register_gradient_hooks(model)
-    
-    # ====== DEBUG: print optimizer lr groups ======
-    # trainer.create_optimizer()
-    # print("\n===== Parameter → lr mapping (sample) =====")
-    # for i, group in enumerate(trainer.optimizer.param_groups):
-    #     lr = group["lr"]
-    #     wd = group.get("weight_decay", None)
-    #     for p in group["params"]:
-    #         for name, p0 in model.named_parameters():
-    #             if p is p0:
-    #                 if "text_dla" in name or name.endswith(".alpha"):
-    #                     print(f"{name:60s}  lr={lr:.2e}  wd={wd}")
-    #                 break
-    # print("==========================================\n")
-
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)
     else:
         trainer.train()
 
-    # print("\n🔍 deep check trainer.state:")
-    # find_tensors_recursive(trainer.state, "trainer.state")
-
-    # print("\n🔍 deep check model.config:")
-    # find_tensors_recursive(model.config, "model.config")
 
     trainer.save_state()
 

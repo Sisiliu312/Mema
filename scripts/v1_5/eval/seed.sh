@@ -1,8 +1,4 @@
 #!/bin/bash
-cd /code/LLaVA-scvm-answerloss
-export PYTHONWARNINGS="ignore"
-# CUDA_VISIBLE_DEVICES=0
-
 gpu_list="${CUDA_VISIBLE_DEVICES:-0,1}"
 IFS=',' read -ra GPULIST <<< "$gpu_list"
 
@@ -12,7 +8,7 @@ CKPT="llava-v1.5-7b"
 
 for IDX in $(seq 0 $((CHUNKS-1))); do
     CUDA_VISIBLE_DEVICES=${GPULIST[$IDX]} python -m llava.eval.model_vqa_loader \
-        --model-path /checkpoints/llava-v1.5-scvm-answerloss/$CKPT  \
+        --model-path /path/to/your_checkpoint_dir \
         --question-file /dataset/eval/seed_bench/llava-seed-bench.jsonl \
         --image-folder /dataset/eval/seed_bench \
         --answers-file /dataset/eval/seed_bench/answers/$CKPT/${CHUNKS}_${IDX}.jsonl \
