@@ -45,13 +45,11 @@ bash /scripts/v1_5/finetune_task.sh
 
 ## Evaluation
 
-Run evaluation scripts under:
+We follow the evaluation setup of LLaVA.
 
-```bash
-/scripts/v1_5/eval
-```
+Reference:
+- LLaVA GitHub: https://github.com/haotian-liu/LLaVA
 
-You can execute the corresponding `.sh` files in that directory based on the benchmark you need.
 
 ## Acknowledgement
 
